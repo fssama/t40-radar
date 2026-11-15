@@ -19,3 +19,6 @@ data/
 .idea/
 *.swp
 .DS_Store
+
+# ssh 的 known_hosts 重定向在 Windows 上会生成同名文件
+NUL

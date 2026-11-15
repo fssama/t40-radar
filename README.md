@@ -42,42 +42,7 @@ Python 3.8+，不需要 `pip install` 任何东西。
 
 ---
 
-## 3. 用手机当"假雷达"
-
-雷达还没到货时，可以用另一台设备扮演雷达，把**真协议帧**发过来，
-端到端验证 "UDP 40204 → 解析 → 显示" 这条链。
-
-手机上（Termux，需要 `pkg install python`）：
-
-```bash
-python tools/radar_udp_sender.py --host <电脑局域网IP> --scene room
-```
-
-电脑上：
-
-```bash
-python run.py --source udp --host 0.0.0.0
-```
-
-然后手机浏览器打开 `http://<电脑IP>:8010/` 也能看同一个画面。
-
-`radar_udp_sender.py` 是单文件、零依赖（CRC 表用算法生成，与真机 ROM 表逐字节一致），
-参数：
-
-```
---host      目标 IP（必填）
---port      默认 40204
---fps       默认 10
---rpm       默认 900
---range     量程 m，默认 30
---height    雷达离地 m，默认 1.8
---scene     room | field | wire | obstacle
---duration  秒，0=一直发
-```
-
----
-
-## 4. 真雷达到了之后
+## 3. 真雷达到了之后
 
 雷达上电后跑的是它自己的 Linux（Zynq），**它不会向你发送任何数据** ——
 它原本是发给飞控的。所以需要一边扮演飞控（CAN + UDP 服务端），一边收数据。
@@ -107,7 +72,7 @@ python run.py --source udp --host 0.0.0.0
 
 ---
 
-## 5. 协议实现
+## 4. 协议实现
 
 线格式（`backend/protocol/`）：
 
@@ -147,7 +112,7 @@ python run.py --source udp --host 0.0.0.0
 
 ---
 
-## 6. 目录
+## 5. 目录
 
 ```
 run.py                       启动入口
@@ -157,7 +122,7 @@ backend/
   protocol/                  V1/V2 帧、1E61/1E62、CRC
   sim/radar.py               模拟器：场景几何 + 射线投射 + 扫描
 frontend/                    index.html / style.css / app.js（无框架、无构建）
-tools/radar_udp_sender.py    单文件 UDP 上行发送器（手机/树莓派可跑）
+tools/radar_udp_sender.py    单文件 UDP 上行发送器（树莓派/Linux 可跑）
 docs/shot-sim.png            界面截图
 ```
 
@@ -174,7 +139,7 @@ docs/shot-sim.png            界面截图
 
 ---
 
-## 7. 模拟器物理约定
+## 6. 模拟器物理约定
 
 - 地面恒在 `z = -h`（h 为雷达离地高度）。只有俯仰角 ≤ 10° 的地面进波束，
   所以近端从 `r_min = h / tan(10°)` 开始（h=1.8 m 时约 10 m）。
@@ -184,7 +149,7 @@ docs/shot-sim.png            界面截图
 
 ---
 
-## 8. 已知限制
+## 7. 已知限制
 
 - 只实现了**接收**（1E61/1E62）。假飞控的 V1 控制面（50007）与 CAN DUML 不在本工程内，
   真机联调时仍需作者的 `radar_min_client.py` 或等价实现。
@@ -193,7 +158,7 @@ docs/shot-sim.png            界面截图
 
 ---
 
-## 9. 排错
+## 8. 排错
 
 | 现象 | 原因 |
 |---|---|
