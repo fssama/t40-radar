@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """T40 RD2484R 雷达监控系统 —— 启动入口。
 
-    python run.py                     # 模拟模式，本机 http://127.0.0.1:8000
+    python run.py                     # 监听 UDP 40204，页面在 http://127.0.0.1:8000
     python run.py --host 0.0.0.0      # 局域网/手机可访问
-    python run.py --source udp        # 接真机：监听 UDP 40204 的 1E61
     python run.py --open              # 自动打开浏览器
 """
 from __future__ import annotations
@@ -17,7 +16,7 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-from backend.app import RadarApp  # noqa: E402
+from backend.app import RadarApp, UdpSource  # noqa: E402
 from backend.server import create_server  # noqa: E402
 
 BANNER = r"""
@@ -33,33 +32,35 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="T40 RD2484R radar monitor")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址，局域网用 0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--scene", default="room",
-                    choices=["room", "field", "wire", "obstacle"])
-    ap.add_argument("--source", default="sim", choices=["sim", "udp"],
-                    help="sim=内置模拟器，udp=监听真机 40204 上行")
-    ap.add_argument("--fps", type=float, default=10.0, help="推送帧率")
+    ap.add_argument("--source", choices=["udp"], help=argparse.SUPPRESS)
+    ap.add_argument("--udp-host", default="0.0.0.0", help="UDP 监听地址")
+    ap.add_argument("--udp-port", type=int, default=40204, help="1E61 / 1E62 接收端口")
     ap.add_argument("--open", action="store_true", help="启动后打开浏览器")
     args = ap.parse_args()
 
     root = os.path.join(HERE, "frontend")
-    app = RadarApp(scene=args.scene, source=args.source, fps=args.fps)
-    url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{args.port}/"
+    app = RadarApp()
+    httpd = create_server(app, root, args.host, args.port)
+    udp = None
+    url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{httpd.server_port}/"
 
-    with create_server(app, root, args.host, args.port) as httpd:
-        try:
-            app.start()
-            print(BANNER)
-            print(f"  数据源   : {args.source}")
-            print(f"  监听     : http://{args.host}:{args.port}/")
-            print(f"  打开     : {url}")
-            print(f"  提示     : Ctrl+C 退出\n")
-            if args.open:
-                threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\n正在退出…")
-        finally:
-            app.stop()
+    try:
+        udp = UdpSource(app, bind_host=args.udp_host, bind_port=args.udp_port)
+        udp.start()
+        print(BANNER)
+        print(f"  实机上行 : UDP {args.udp_host}:{udp.bind_port}")
+        print(f"  浏览页面 : {url}")
+        print("  提示     : Ctrl+C 退出\n")
+        if args.open:
+            threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n正在退出…")
+    finally:
+        if udp is not None:
+            udp.stop()
+            udp.join(timeout=1.0)
+        httpd.server_close()
     return 0
 
 

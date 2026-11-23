@@ -81,13 +81,10 @@
 - 已创建 systemd 服务 `/etc/systemd/system/can0.service`（`enabled`，开机自动拉起 can0）
 - CANable 端子丝印（从上到下）：**GND / CANH / CANL**，120Ω 拨码 `OFF|ON`
 
-### 3.4 监控系统（模拟器版，已可用）
-- 代码：`E:\dsh\t40-radar\`
-- 零依赖（Python 标准库 + 原生 JS），`python run.py --port 8010`
-- **数据走真实协议栈**：模拟器 → `Record1E61` → `build_1e61()` → `build_v2()` → `parse_v2()` → JSON
-- 前端：浅色纸面风格（仿作者视频），极坐标点云 + 跟踪列表 + 俯仰剖面 + 协议帧 hex
-- 支持 `--source sim`（模拟）/ `--source udp`（收真实 UDP 40204）/ `?snapshot=N`（离线截图）
-- **跟踪层已实现**：`backend/track.py`，DBSCAN 聚类（eps 0.5m）+ α-β 滤波，实测能跟踪 1.2m/s 走动的人
+### 3.4 实机监控系统
+- 代码：`E:\dsh\t40-radar`，启动命令 `python run.py --port 8010`。
+- UDP 40204 接收 1E61 点云以及 VM 转发的 1E62 避障结果。两路各自判断时效。
+- 页面显示极坐标点云、跟踪目标、最近障碍物、融合高度、16 个扇区和原始帧。
 
 ### 3.5 采购（¥84.74 那单）
 | 件 | 价格 | 状态 |
@@ -250,13 +247,13 @@ D:/vm/vmrun.exe list
 4. SSH 进去，`radar_viewer.py --deploy` 看顶阵热图（**不需要 CAN**）
 
 ### P1（顶阵通了之后）
-5. `duml_can_tool.py --can-bridge can0` 设 motor-speed 到 900rpm
-6. 用 `radar_min_client.py --can-bridge can0` 跑假 FC
+5. 需要调速时由现场通过独立的 CAN 控制设速。
+6. 用 `tools/radar_avoidance_relay.py` 保持 flight_mode=2 并转发 1E62。
 7. `candump can0` 应看到 `0x18` 的 DUML 帧
 
 ### P2（侧面点云通了之后）
 8. 接 `radar_streamer side`，看侧面 360° 点云
-9. 把真实数据接进 `E:\dsh\t40-radar\` 的前端（`--source udp`）
+9. 把真实数据接进 `E:\dsh\t40-radar\` 的前端（`python run.py`）
 
 ### P3（可选，高难度）
 10. 试 `0x1EFD` 通道（FFT 结果 UDP 包，格式已知）

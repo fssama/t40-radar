@@ -1,48 +1,31 @@
 # RD2484R 雷达监控系统（T40 / DJI Agras）
 
 大疆 T40 农业无人机 **RD2484R 24 GHz 有源相控阵雷达**的前后端监控系统。
-零第三方依赖（纯 Python 标准库 + 原生 JS），模拟数据源与真机 UDP 数据源共用同一套协议栈，
-**接上真雷达时只需改一个启动参数**。
+使用 Python 标准库和原生 JavaScript，接收实机上报的 1E61 点云与 1E62 避障结果。
 
 > 协议逆向参考 [leommxj/dji-agras-radar](https://github.com/leommxj/dji-agras-radar)（作者公开了
 > CAN/DUML、UDP V1/V2 帧格式与内存导出脚本）。本工程是独立实现，未复制其代码。
 >
 > 📘 **完整工作流（购物清单 / 接线教程 / 部署 / 协议 / 排错）见 [docs/WORKFLOW.md](docs/WORKFLOW.md)。**
->
-> Ubuntu 自动部署、AR1021x 开机选驱动及 USB 热插拔验证见 [Agent 部署工作流](docs/AGENT-DEPLOY.md)。
 
 ---
 
-## 1. 它长什么样
+## 1. 监控页面
 
-![界面](docs/shot-sim.png)
+全向点云支持自动量程、固定量程和地面、线缆、障碍图层开关。右栏显示最近障碍物、16 个扇区、融合高度、航迹和原始帧。电机控制折叠在读数下方，填入目标转速并提交后才下发。
 
-左侧极坐标 PPI（16 dB 分档点云 + 扫描线 + 扇区告警），右侧最近障碍物 / 电机转速 /
-融合高度 / 俯仰剖面 / 1E61 实时协议帧，底部启停、转速、场景、高度、量程控制。
-
----
+航迹由 1E61 障碍点云生成。每条航迹需要三次独立观测才能确认，预测中的航迹会保留原 ID 并标注状态。在 1.25 秒内没有新观测时清除航迹。
 
 ## 2. 快速开始
 
 ```bash
-cd t40-radar
-python run.py                 # 模拟模式，http://127.0.0.1:8000
-python run.py --open          # 顺便打开浏览器
-python run.py --host 0.0.0.0  # 局域网可访问（手机/别的电脑）
-python run.py --port 8010     # 换端口
+python run.py                 # 本机浏览器 http://127.0.0.1:8000
+python run.py --open          # 启动后打开本机页面
+python run.py --host 0.0.0.0  # 允许同一局域网访问
+python run.py --port 8010     # 更改网页端口
 ```
 
-Python 3.8+，不需要 `pip install` 任何东西。
-
-### 三种数据源
-
-| 模式 | 命令 | 说明 |
-|---|---|---|
-| 内置模拟 | `python run.py` | 后端自己造点云，走完整协议栈 |
-| 外部 UDP | `python run.py --source udp` | 监听 `0.0.0.0:40204`，解析真实 V2/1E61 |
-| 离线快照 | 浏览器加 `?snapshot=30` | 不连 SSE，一次拉 N 帧，用于截图/演示 |
-
----
+使用 Python 3.10 或更新版本。默认监听 `0.0.0.0:40204`，可用 `--udp-host` 和 `--udp-port` 调整。未收到实机数据时页面显示等待状态。
 
 ## 3. 真雷达到了之后
 
@@ -56,7 +39,7 @@ Python 3.8+，不需要 `pip install` 任何东西。
     ^                                    |
     |--- CAN 1 Mbit (0x0A2 / 0x0A3) ------|  假飞控：发心跳/电机指令
     |--- UDP 50007 (V1 控制面) -----------|
-    |--- UDP 40204 (V2 上行 1E61) ------->|  本工程 --source udp 就监听这里
+    |--- UDP 40204 (V2 上行 1E61) ------->|  VM 转发到监控程序的 UDP 40204
 ```
 
 要点：
@@ -66,11 +49,33 @@ Python 3.8+，不需要 `pip install` 任何东西。
 2. 网卡驱动用 `ar1021x_driver/`（作者的 out-of-tree ath6kl，6 处修改），固件放
    `/lib/firmware/ath6k/AR6004/hw3.0/`。
 3. 起 AP：`setup/start_ap.sh`，`hostapd.conf` 里 `ignore_broadcast_ssid` **必须注释掉**。
-4. 电机不转 = 没有数据。编码器是物理线直连 FPGA 的，`--sim-esc` 只能骗状态机，
-   不会产生任何回波。转速用 `duml_can_tool.py` 设（上电默认 60 rpm，上限 1800）。
-5. 拿到数据后，本工程只改 `--source udp` 即可，协议层与前端零改动。
+4. 侧阵点云依赖电机和编码器。1E62 到包时也可能只有占位扇区。若需调速，由现场通过 `duml_can_tool.py` 或电机控制表单操作。
+5. 宿主机启动 `python run.py`。在 VM 里运行 `python3 tools/forward_40204.py` 转发 1E61，并用以下命令替代原先的 `radar_min_client.py`，以转发 1E62。两个客户端不能同时绑定 UDP 50007：
+
+   ```bash
+   python3 tools/radar_avoidance_relay.py ~/work/dji-agras-radar/radar_client 192.168.59.1
+   ```
+
+   1E62 转发器从第一帧起就使用 `flight_mode=2`，不接入 CAN。页面分别显示网页连接和雷达收包状态。1E61 点云与 1E62 避障结果独立判断时效，某一路 5 秒没收到有效帧时，页面会清除该路的旧结果。收到 1E62 但扇区全部为占位值时，「最近障碍物」显示「无有效距离」。
 
 > ⚠️ 900–1800 rpm 的旋转体必须先固定，作者实测 1800 rpm 时雷达会"飞出去"。
+
+排查固定方位缺点时，可以从雷达已运行的 `radar_streamer side`（UDP 9877）读取侧阵 OMNI v2 数据。以下命令在能直达雷达的主机上运行。
+
+```bash
+python3 tools/read_omni_sectors.py --host 192.168.8.2 --seconds 5 --capture side.omni --csv side.csv
+python3 tools/read_omni_sectors.py --input side.omni
+```
+
+工具按机体方位统计原始 CFAR 回波，CSV 保留编码器槽位、方位、斜距和 SNR。默认把编码器槽位 0 对准 180°，可通过 `--offset` 校准。表中每 22.5° 一格，统计的是采样时的原始回波，和 `1E62` 的 16 个结果槽位各有用途。现有 `radar_streamer` 每个槽位最多导出 7 条回波，连续快照可能重复包含同一条记录。
+
+雷达运行 `radar_streamer side` 时，在 Ubuntu 虚拟机运行以下命令即可把原始帧转发到 Windows 的监控程序。
+
+```bash
+python3 tools/read_omni_sectors.py --host 192.168.8.2 --forward-host 192.168.59.1
+```
+
+页面收到有效 OMNI 帧时会在极坐标图上显示紫色空心点。图例中的「原始回波」可切换这一图层。原始回波使用斜距，`1E61` 图层使用水平距离，两者可按方位对照。航迹和 `1E62` 避障卡片继续使用各自的雷达业务报文。
 
 ---
 
@@ -100,19 +105,14 @@ Python 3.8+，不需要 `pip install` 任何东西。
 头  +3..4   记录数 N (u16)
 头  +65..66 subtype：0=ground / 1=wire / 2=pcla
 记录 <H f f f H> = id(u16), x(f32), y(f32), z(f32), metric(u16)
-                  body 坐标系：前 x / 右 y / 上 z，线上单位 dm（0.1 m）
-                  模拟场景、SSE 和跟踪使用米，编码和解码各转换一次
+                  body 坐标系：前 x / 右 y / 上 z，原始单位 dm
                   metric = 置信度 × 65535
 ```
 
-**0x1E62 避障结果**（116 B）：16 个扇区项（方位/仰角/距离）+ 卡尔曼高度 + 融合高度 + 置信度。
+**0x1E62 避障结果**（UDP 50007，V1，116 B 载荷）：`+8` 为扇区头 `0x10`，`+9..104` 为 16 项连续的 `<HHH>`（方位百分度、仰角百分度、距离厘米）。`10000 cm` 是占位距离；`+109` 为单字节高度置信度，计数器在 `+115`。首扇区的 `40.96 m` 是旧解码器读错距离字段产生的假值。
 
 **CRC**：CRC8 反射 poly `0x8C` init `0x77`；CRC16 反射 poly `0x8408` init `0x3692`。
-表在 `backend/protocol/crc_tables.py`（从原作者的 ROM 表抽取），
-`tools/radar_udp_sender.py` 里用算法生成同一张表并做了逐字节校验。
-
-UDP 接收仅处理通过 CRC8、CRC16 和长度校验的 1E61。空点云可以是有效帧。
-`GET /api/protocol` 返回示例帧的 hex，方便和真机抓包对照。
+查表位于 `backend/protocol/crc_tables.py`。`GET /api/protocol` 提供最近接收的两种帧的校验结果和前 40 字节，尚未收到的类型返回 `null`。
 
 ---
 
@@ -121,13 +121,12 @@ UDP 接收仅处理通过 CRC8、CRC16 和长度校验的 1E61。空点云可以
 ```
 run.py                       启动入口
 backend/
-  app.py                     RadarApp（tick 线程 / SSE 广播 / UdpSource / ingest_udp）
+  app.py                     UDP 接收、航迹与 SSE 广播
   server.py                  ThreadingHTTPServer + SSE + 控制 API
   protocol/                  V1/V2 帧、1E61/1E62、CRC
-  sim/radar.py               模拟器：场景几何 + 射线投射 + 扫描
 frontend/                    index.html / style.css / app.js（无框架、无构建）
-tools/radar_udp_sender.py    单文件 UDP 上行发送器（树莓派/Linux 可跑）
-docs/shot-sim.png            界面截图
+tools/forward_40204.py       VM 侧 1E61 转发
+tools/radar_avoidance_relay.py VM 侧 1E62 转发
 ```
 
 ### HTTP 接口
@@ -136,40 +135,26 @@ docs/shot-sim.png            界面截图
 |---|---|---|
 | GET | `/` | 页面 |
 | GET | `/events` | SSE 帧流 |
-| GET | `/api/state` | 当前状态 JSON。UDP 模式的 `data_status` 为 `waiting`、`live` 或 `stale` |
+| GET | `/api/state` | 当前状态 JSON，真机模式下 `radar` 分别报告 1E61 和 1E62 的 `waiting` / `live` / `stale` |
 | GET | `/api/protocol` | 最近一帧协议字段 + hex |
-| GET | `/api/snapshot?n=30` | 合成 N 帧（离线快照） |
-| POST | `/api/control` | `{action: start\|stop\|toggle\|rpm\|scene\|height, value}` |
+| POST | `/api/control` | `{"action":"motor","value":转速}`，经 VM 桥下发 |
 
 ---
 
-UDP 模式下，1E61 未提供实测转速、运行状态、扫描角、离地高度和高度门控，相关字段为 `null`。`motor_speed` 仍表示保存的下发值。连续 2 秒未收到有效 1E61 时清空当前点云和航迹，SSE 保持连接。每个 SSE 客户端只保留最新一条待发消息。
+## 6. 已知限制
 
-## 6. 模拟器物理约定
-
-- 地面恒在 `z = -h`（h 为雷达离地高度）。只有俯仰角 ≤ 10° 的地面进波束，
-  所以近端从 `r_min = h / tan(10°)` 开始（h=1.8 m 时约 10 m）。
-- 每帧扫过 `sweep = clamp(rpm × 6 × dt × 0.35, 6°, 90°)` 的扇区；900 rpm @10 fps 约 60°。
-- 内置模拟器运行时每帧发射 300 条射线并生成 60 个地面点。协议面板展示单一 subtype 的 1E61 编码并校验往返，独立 UDP 模拟器按 subtype 分包。
-- 高度 < 160 cm 且 running 时，前端会提示"低于 1.6 m 门限，避障被清零"（真机行为）。
-
----
-
-## 7. 已知限制
-
-- 实时 UDP 点云接收消费 1E61。1E62 的编解码未接入这条实时链路。假飞控的 V1 控制面（50007）与 CAN DUML 不在本工程内，
+- 只实现了**接收**（1E61/1E62）。假飞控的 V1 控制面（50007）与 CAN DUML 不在本工程内，
   真机联调时仍需作者的 `radar_min_client.py` 或等价实现。
 - 不带录制/回放（可作为下一步：把 `/events` 落 JSONL 再回放）。
 - 顶面 4×4 阵的原始热图不在网络协议里，只能从雷达进程内存读，本工程未涉及。
 
 ---
 
-## 8. 排错
+## 7. 排错
 
 | 现象 | 原因 |
 |---|---|
 | 页面打开全空 | 端口被占 / 后端崩了，看终端 traceback |
 | SSE 一直"连接中" | 反向代理缓冲了 `text/event-stream`，或防火墙拦了 |
-| `--source udp` 收不到 | 发送端没发到 `40204`，或被 Windows 防火墙拦（首次会弹窗） |
+| 收不到雷达数据 | 发送端没发到 `40204`，或被 Windows 防火墙拦（首次会弹窗） |
 | 手机连不上电脑 | `run.py` 要用 `--host 0.0.0.0`，且同一局域网 |
-| 点云挤在 0°/180° | 扫描角推进用了物理转速（已修，见 `sim/radar.py` 注释） |

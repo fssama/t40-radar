@@ -7,11 +7,8 @@ from .crc import crc8, crc16, CRC8_INIT, CRC16_INIT
 from .duml import V1Frame, build_v1, parse_v1, split_can_blocks
 from .v2 import (
     V2Frame,
-    build_v2,
     parse_v2,
-    build_1e61,
     parse_1e61,
-    build_1e62,
     parse_1e62,
     Record1E61,
     UNIT_DM,
@@ -27,9 +24,9 @@ from .v2 import (
 __all__ = [
     "crc8", "crc16", "CRC8_INIT", "CRC16_INIT",
     "V1Frame", "build_v1", "parse_v1", "split_can_blocks",
-    "V2Frame", "build_v2", "parse_v2",
-    "build_1e61", "parse_1e61", "Record1E61", "UNIT_DM",
-    "build_1e62", "parse_1e62",
+    "V2Frame", "parse_v2",
+    "parse_1e61", "Record1E61", "UNIT_DM",
+    "parse_1e62",
     "MSG_PERCEPTION", "MSG_BLACKBOX",
     "SUBTYPE_GROUND", "SUBTYPE_WIRE", "SUBTYPE_PCLA",
     "EP_PERCEPTION", "EP_BLACKBOX",

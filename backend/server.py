@@ -9,6 +9,7 @@ import json
 import mimetypes
 import os
 import queue
+import math
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -26,12 +27,15 @@ MIME = {
 }
 
 
-SSE_WRITE_TIMEOUT = 5.0
-
-
 class Handler(BaseHTTPRequestHandler):
     app: RadarApp = None       # 由 create_server 注入
     root: str = ""
+
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionError:
+            pass  # 浏览器刷新或取消请求时可能提前关闭连接
 
     # 关掉默认的 stderr 噪声
     def log_message(self, fmt, *args):
@@ -75,15 +79,23 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/events":
             return self._sse()
         if p == "/api/state":
-            return self._send_json(self._state())
+            radar = self.app.radar_status()
+            return self._send_json({
+                "running": radar["point_cloud"] == "live",
+                "frames": self.app.frame_count,
+                "crc_ok": True if radar["point_cloud"] == "live" else None,
+                "source": "udp",
+                "motor_speed": self.app.last_motor,
+                "avoidance": self.app.current_avoidance(),
+                "radar": radar,
+            })
         if p == "/api/protocol":
-            # 协议演示：把当前配置编码成真实帧，回 hex（可给真机抓包比对）
-            return self._send_json(self._protocol_demo())
-        if p == "/api/snapshot":
-            from urllib.parse import parse_qs
-            q = parse_qs(url.query)
-            n = max(1, min(80, int(q.get("n", ["12"])[0])))
-            return self._send_json(self.app.snapshot(n))
+            avoidance = self.app.current_avoidance()
+            return self._send_json({
+                "1E61": self.app.last_point_protocol,
+                "1E62": avoidance["proto"] if avoidance else None,
+                "radar": self.app.radar_status(),
+            })
 
         full = self._resolve(p)
         if not full:
@@ -98,98 +110,38 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, ctype)
 
     def do_POST(self):
-        url = urlparse(self.path)
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n) if n else b"{}"
+        if urlparse(self.path).path != "/api/control":
+            return self._send_json({"ok": False, "error": "unknown endpoint"}, 404)
         try:
-            body = json.loads(raw.decode() or "{}")
-        except json.JSONDecodeError:
-            return self._send_json({"ok": False, "error": "bad json"}, 400)
-
-        if url.path == "/api/control":
-            return self._send_json(self._control(body))
-        self._send_json({"ok": False, "error": "unknown endpoint"}, 404)
-
-    # ---------------- 业务 ----------------
-    def _state(self) -> dict:
-        app = self.app
-        sim = app.sim
-        udp = app.source == "udp"
-        with app.sim_lock, app.lock:
-            data_status = app.udp_data_status() if udp else None
-            return {
-                "running": None if udp else sim.state.running,
-                "rpm": None if udp else sim.state.rpm,
-                "angle": None if udp else sim.state.angle,
-                "scene": sim.scene.kind,
-                "scenes": sim.scenes,
-                "height_cm": None if udp else sim.state.height_cm,
-                "frames": app.frame_count,
-                "crc_ok": None if udp and data_status != "live" else app.last_crc_ok,
-                "source": app.source,
-                "motor_speed": app.last_motor,
-                **({"data_status": data_status} if udp else {}),
-            }
-
-    def _control(self, body: dict) -> dict:
-        sim = self.app.sim
-        act = body.get("action")
-        val = body.get("value")
-        if act == "motor":
-            # 转速走真机链路（VM 桥 → CAN → ESC）；dry=true 只回执不动电机
-            return self.app.set_motor(float(val), bool(body.get("dry", False)))
-
-        with self.app.sim_lock:
-            if act == "start":
-                sim.start()
-            elif act == "stop":
-                sim.stop()
-            elif act == "toggle":
-                sim.stop() if sim.state.running else sim.start()
-            elif act == "rpm":
-                sim.set_rpm(float(val))
-            elif act == "scene":
-                sim.set_scene(str(val))
-            elif act == "height":
-                sim.set_height(float(val))
-            elif act == "range":
-                sim.view_range = max(1.0, min(50.0, float(val)))
-            else:
-                return {"ok": False, "error": f"unknown action {act!r}"}
-        state = self._state()
-        return {"ok": True, **{k: state[k] for k in ("running", "rpm", "scene", "height_cm")}}
-
-    def _protocol_demo(self) -> dict:
-        """生成一组示例帧的 hex 说明，供与真机抓包比对。"""
-        from .protocol import Record1E61, build_1e61, build_1e62, build_v2
-        recs = [Record1E61.from_metres(1, 3.0, 0.4, -0.05, 32000),
-                Record1E61.from_metres(1, 4.2, -0.9, -0.12, 28000),
-                Record1E61.from_metres(2, 9.5, 1.2, 0.30, 21000)]
-        p61 = build_1e61(recs, subtype=2, seq=1)
-        f61 = build_v2(0x1E61, p61, seq=1)
-        p62 = build_1e62(height_kalman_cm=152, height_filtered_cm=150,
-                         height_confidence=88)
-        f62 = build_v2(0x1E62, p62, seq=1)
-        return {
-            "1E61": {"len": len(f61), "hex": f61.hex(" "),
-                     "layout": "V2 27B 头 + 1E61 69B 头 + 3×16B 记录 + CRC16"},
-            "1E62": {"len": len(f62), "hex": f62.hex(" "),
-                     "layout": "V2 27B 头 + 1E62 116B + CRC16"},
-            "crc": {"crc8_init": "0x77", "crc16_init": "0x3692"},
-        }
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 4096:
+                raise ValueError("invalid request length")
+            body = json.loads(self.rfile.read(length))
+            if not isinstance(body, dict) or body.get("action") != "motor":
+                raise ValueError("unknown action")
+            speed = float(body["value"])
+            dry = body.get("dry", False)
+            if not math.isfinite(speed) or not 0 <= speed <= 1800 or not isinstance(dry, bool):
+                raise ValueError("invalid motor command")
+        except (ValueError, TypeError, KeyError, OverflowError) as exc:
+            return self._send_json({"ok": False, "error": str(exc)}, 400)
+        return self._send_json(self.app.set_motor(speed, dry))
 
     # ---------------- SSE ----------------
     def _sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
         client = self.app.add_client()
         try:
-            self.connection.settimeout(SSE_WRITE_TIMEOUT)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache, no-transform")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
             self.wfile.write(b": connected\n\n")
+            status = {"type": "radar_status", "radar": self.app.radar_status(),
+                      "avoidance": self.app.current_avoidance()}
+            self.wfile.write(b"data: " + json.dumps(status).encode() + b"\n\n")
             self.wfile.flush()
             while True:
                 try:
@@ -198,15 +150,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     continue
-                if data is None:
-                    break
                 self.wfile.write(b"data: " + data.encode() + b"\n\n")
                 self.wfile.flush()
-        except OSError:
+        except (BrokenPipeError, ConnectionResetError, OSError):
             pass
         finally:
             self.app.remove_client(client)
-            self.close_connection = True
 
 
 def create_server(app: RadarApp, root: str, host: str = "127.0.0.1",

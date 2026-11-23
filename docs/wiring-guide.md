@@ -261,18 +261,14 @@ candump can0
 
 看到 `0A3` 的帧 = CAN 通了。
 
+启动侧阵采集和两路转发前，先把 `tools/radar_avoidance_relay.py` 和 `tools/forward_40204.py` 复制到 VM。两个命令分别在 VM 的终端运行。
+
 ```bash
-# 3) 让电机转起来（假飞控）
-cd ~/work/dji-agras-radar/radar_client
-source ../venv/bin/activate
-python radar_min_client.py --can-bridge can0 --send-motor-start --send-data-start-type 0 --plot
+~/work/venv/bin/python /tmp/radar_avoidance_relay.py ~/work/dji-agras-radar/radar_client 192.168.59.1
+python3 /tmp/forward_40204.py
 ```
 
-参数说明：
-
-- `--can-bridge can0`：走真 CAN（**不能和 `--sim-esc` 同时用**，两者互斥）
-- `--send-motor-start`：发使能命令（`0x1E/0x09`）
-- `--send-data-start-type 0`：开始要数据
+需要电机转动时由现场通过独立的 CAN 控制设速。UDP 控制客户端保持 `flight_mode=2`，不要加 `--can-bridge` 或 `--send-motor-start`。
 
 ### 6.3 看真数据
 
@@ -307,7 +303,7 @@ candump can0                            # 看到 0A3 帧
 
 # --- 我们的 Web 端 ---
 cd /path/to/t40-radar
-python run.py --source udp --port 8010 --host 0.0.0.0
+python run.py --port 8010 --host 0.0.0.0
 # 浏览器打开 http://<电脑IP>:8010
 ```
 
@@ -318,7 +314,7 @@ python run.py --source udp --port 8010 --host 0.0.0.0
 **必须**
 
 1. 电机**真的转起来**，侧面点云才会刷
-2. `--can-bridge` 和 `--sim-esc` **只能二选一**，真机用前者
+2. 侧阵控制面保持 `flight_mode=2`，实机 1E62 由转发脚本送到宿主机。
 3. 雷达的 `192.168.8.2` 是**静态 IP**，不需要 DHCP
 
 **绝对不要**
@@ -342,9 +338,8 @@ python run.py --source udp --port 8010 --host 0.0.0.0
 | `ping 192.168.8.2` 不通 | 雷达没连上 / zynq 没启动完 | 等 30 秒再试；`sudo iw dev wlx... station dump` 看有没有客户端 |
 | SSH 报 `no matching host key type` | dropbear 只给 ssh-dss | 加 `-oHostKeyAlgorithms=+ssh-dss` |
 | `candump` 什么都没有 | bitrate 错 / 线接反 / 终端电阻没开 | 确认 1 Mbit；CANH/CANL 对调试试；拨码 ON |
-| 有 CAN 帧但没点云 | 电机没转 / 编码器没信号 | 先确认上半板在转；`radar_min_client.py --send-motor-start` |
+| 有 CAN 帧但没点云 | 电机没转 / 编码器没信号 | 确认侧阵控制客户端运行，以及当前转速能产生回波 |
 | 点云一直是空的 | 编码器没被采信 | 看 `dmesg` 有没有 `[FMCT] wrong sample key`；这是软件修不了的硬约束 |
-| `--sim-esc` 报 not allowed | 和 `--can-bridge` 互斥 | 真机去掉 `--sim-esc` |
 
 ---
 

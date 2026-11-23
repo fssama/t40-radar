@@ -1,541 +1,521 @@
 'use strict';
-/* RD2484R 雷达监视前端 v5
- * 数据源：SSE /events（backend 推送的 1E61 帧）
- * 点结构：[az°, r_m, z_m, snr_0_1, subtype]
- *   subtype 0 = ground（地面点，侧阵下视波束，铺满远处）
- *   subtype 1 = wire  （线缆，常是雷达自身高度附近）
- *   subtype 2 = pcla  （障碍物，真正需要看的）
- * 控制：POST /api/control  {action, value}
- *   action ∈ start | stop | toggle | motor | scene | height
- *   motor 走完整链路：后端 → VM UDP 50009 → duml_can_tool → CAN → ESC
- */
-(() => {
-  const $ = (id) => document.getElementById(id);
-  const TAU = Math.PI * 2;
-  const DEG = Math.PI / 180;
 
-  const RANGES = [5, 10, 20, 50];
-  const LIFE_MS = 4000;          // 点寿命
-  const MAX_PTS = 16000;         // 上限，防内存膨胀
-  const SUB_STYLE = [
-    { c: 'rgba(120,155,195,0.45)', w: 2.8, name: '地面' },
-    { c: 'rgba(240,180,41,0.95)', w: 3.8, name: '线缆' },
-    { c: 'rgba(61,220,132,1.0)', w: 4.6, name: '障碍' },
-  ];
+const byId = (id) => document.getElementById(id);
+const now = () => performance.now();
+const FEEDS = { point_cloud: '1e61', avoidance: '1e62' };
+const WATCHDOG_MS = 6500;
+const POINT_LIFE_MS = 4000;
+const MAX_POINTS = 16000;
+const RANGES = [5, 10, 20, 50];
+const RINGS = { 5: 5, 10: 5, 20: 4, 50: 5 };
+const LAYERS = [
+  { label: '地面', color: '#80a1bf', radius: 2.1, visible: true },
+  { label: '线缆', color: '#efba6c', radius: 2.8, visible: true },
+  { label: '障碍', color: '#60e2ac', radius: 3.3, visible: true },
+];
+const OMNI_LAYER = { label: '原始回波', color: '#c9a4ff', visible: true };
 
-  const S = {
-    connected: false,
-    running: false,
-    crcOk: null,
-    src: '—',
-    range: 10,
-    heightCm: null,
-    udpStatus: null,
-    udpEpoch: null,
-    scene: 'room',
-    motor: { value: 60, status: 'idle', detail: '' },
-    points: [],
-    tracks: [],
-    proto: null,
-    total: 0,
-    marks: [],            // 帧率统计
-  };
+const state = {
+  points: [],
+  omniPoints: [],
+  omniAt: null,
+  frameTimes: [],
+  pointPacket: null,
+  feeds: { point_cloud: 'waiting', avoidance: 'waiting' },
+  deadlines: { point_cloud: 0, avoidance: 0 },
+  range: 10,
+  manualRange: null,
+};
 
-  /* ── 工具 ───────────────────────────────────────── */
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-  const now = () => performance.now();
+const canvas = byId('ppi');
+const ctx = canvas.getContext('2d');
+const profile = byId('profile');
+const profileCtx = profile.getContext('2d');
+let width = 0, height = 0, radius = 0, cx = 0, cy = 0;
+let profileWidth = 0, profileHeight = 0;
+let pendingDraw = false;
+const sectors = [];
+const rangeButtons = new Map();
 
-  function setBadge(el, text, cls) {
-    if (!el) return;
-    el.className = 'badge ' + (cls || '');
-    el.replaceChildren(document.createElement('i'), text);
-  }
+function badge(id, text, tone = '') {
+  const el = byId(id);
+  el.textContent = text;
+  el.className = 'badge ' + tone;
+}
 
-  /* ── PPI 画布 ───────────────────────────────────── */
-  const canvas = $('ppi');
-  const ctx = canvas.getContext('2d');
-  let W = 0, H = 0, CX = 0, CY = 0, R = 0, DPR = 1;
+function resizePlot() {
+  width = canvas.clientWidth;
+  height = canvas.clientHeight;
+  const ratio = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  profileWidth = profile.clientWidth;
+  profileHeight = profile.clientHeight;
+  profile.width = Math.round(profileWidth * ratio);
+  profile.height = Math.round(profileHeight * ratio);
+  profileCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  cx = width / 2;
+  cy = height / 2;
+  radius = Math.max(0, Math.min(width, height) / 2 - 32);
+  schedulePlot();
+}
 
-  function resize() {
-    const wrap = canvas.parentElement;
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
-    W = wrap.clientWidth;
-    H = wrap.clientHeight;
-    canvas.width = Math.round(W * DPR);
-    canvas.height = Math.round(H * DPR);
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    R = Math.max(40, Math.min(W, H) / 2 - 18);
-    CX = W / 2;
-    CY = H / 2 + 4;
-  }
+function polar(angle, r) {
+  const radians = angle * Math.PI / 180;
+  return [cx + Math.sin(radians) * r, cy - Math.cos(radians) * r];
+}
 
-  const toScreen = (azDeg, rM) => {
-    const a = azDeg * DEG;
-    const rr = clamp(rM / S.range, 0, 1.35) * R;
-    return [CX + Math.sin(a) * rr, CY - Math.cos(a) * rr];
-  };
+function drawGrid(range) {
+  ctx.clearRect(0, 0, width, height);
+  if (!radius) return;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+  const shade = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+  shade.addColorStop(0, '#142a3b');
+  shade.addColorStop(1, '#0e1b2b');
+  ctx.fillStyle = shade;
+  ctx.fill();
+  ctx.strokeStyle = '#36536a';
+  ctx.stroke();
 
-  function drawGrid() {
-    ctx.clearRect(0, 0, W, H);
-
-    // 外环
-    ctx.save();
-    ctx.strokeStyle = 'rgba(90,110,135,0.28)';
-    ctx.lineWidth = 1;
+  ctx.strokeStyle = '#263d53';
+  for (let angle = 0; angle < 360; angle += 45) {
+    const [x, y] = polar(angle, radius);
     ctx.beginPath();
-    ctx.arc(CX, CY, R, 0, TAU);
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
     ctx.stroke();
+  }
 
-    // 量程环 + 标签
-    const rings = S.range <= 10 ? [2, 4, 6, 8, 10]
-               : S.range <= 20 ? [5, 10, 15, 20]
-               : S.range <= 30 ? [10, 20, 30] : [10, 20, 30, 40, 50];
-    ctx.font = '10px ui-monospace, Consolas, monospace';
-    ctx.fillStyle = 'rgba(120,140,165,0.65)';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (const m of rings) {
-      const rr = (m / S.range) * R;
-      ctx.beginPath();
-      ctx.strokeStyle = 'rgba(90,110,135,0.17)';
-      ctx.arc(CX, CY, rr, 0, TAU);
-      ctx.stroke();
-      if (m < S.range * 0.995) {
-        ctx.fillText(m + ' m', CX, CY - rr - 7);
-      }
-    }
-
-    // 方位辐条
-    ctx.strokeStyle = 'rgba(90,110,135,0.13)';
-    for (let a = 0; a < 360; a += 45) {
-      const [x, y] = toScreen(a, S.range);
-      ctx.beginPath();
-      ctx.moveTo(CX, CY);
-      ctx.lineTo(x, y);
-      ctx.stroke();
-    }
-
-    // 方位标签
-    ctx.font = '10.5px ui-monospace, Consolas, monospace';
-    ctx.fillStyle = 'rgba(130,150,175,0.75)';
-    for (let a = 0; a < 360; a += 45) {
-      const [x, y] = toScreen(a, S.range * 1.085);
-      ctx.fillText(a + '°', x, y);
-    }
-
-    // 中心
+  ctx.font = '11px ui-monospace, Consolas, monospace';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#92a9c1';
+  const rings = RINGS[range];
+  for (let i = 1; i < rings; i++) {
+    const r = radius * i / rings;
     ctx.beginPath();
-    ctx.fillStyle = 'rgba(45,212,191,0.9)';
-    ctx.arc(CX, CY, 2.6, 0, TAU);
+    ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+    ctx.stroke();
+    ctx.fillText((range * i / rings) + ' m', cx, cy - r + 9);
+  }
+
+  for (let angle = 0; angle < 360; angle += 45) {
+    const [x, y] = polar(angle, radius + 17);
+    ctx.fillStyle = angle === 0 ? '#68e7d4' : '#92a9c1';
+    ctx.fillText(angle + '°', x, y);
+  }
+  ctx.beginPath();
+  ctx.arc(cx, cy, 3, 0, 2 * Math.PI);
+  ctx.fillStyle = '#68e7d4';
+  ctx.fill();
+}
+
+function drawPoints(points, range) {
+  let visible = 0;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, 2 * Math.PI);
+  ctx.clip();
+
+  const omni = state.omniPoints.filter(point => point[1] <= range);
+  OMNI_LAYER.count.textContent = state.omniAt === null ? '—' : omni.length;
+  if (OMNI_LAYER.visible && radius && omni.length) {
+    ctx.beginPath();
+    for (const [az, distance] of omni) {
+      const [x, y] = polar(az, distance * radius / range);
+      ctx.moveTo(x + 2.5, y);
+      ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
+    }
+    ctx.globalAlpha = .75;
+    ctx.strokeStyle = OMNI_LAYER.color;
+    ctx.lineWidth = 1.1;
+    ctx.stroke();
+    visible += omni.length;
+  }
+
+  LAYERS.forEach((layer, subtype) => {
+    let count = 0;
+    ctx.beginPath();
+    for (const point of points) {
+      if (point[4] !== subtype || point[1] > range) continue;
+      count++;
+      if (!radius || !layer.visible) continue;
+      const [x, y] = polar(point[0], point[1] * radius / range);
+      ctx.moveTo(x + layer.radius, y);
+      ctx.arc(x, y, layer.radius, 0, 2 * Math.PI);
+    }
+    layer.count.textContent = count;
+    if (!layer.visible) return;
+    visible += count;
+    ctx.globalAlpha = subtype === 0 ? .74 : .96;
+    ctx.fillStyle = layer.color;
     ctx.fill();
-    ctx.beginPath();
-    ctx.strokeStyle = 'rgba(45,212,191,0.25)';
-    ctx.arc(CX, CY, 8, 0, TAU);
-    ctx.stroke();
-    ctx.restore();
-  }
+  });
+  ctx.restore();
+  return visible;
+}
 
-  function drawPoints(t) {
-    // 按 subtype 分三遍画，地面最底、障碍最上
-    for (let sub = 0; sub < 3; sub++) {
-      const st = SUB_STYLE[sub];
-      ctx.beginPath();
-      let n = 0;
-      for (let i = 0; i < S.points.length; i++) {
-        const p = S.points[i];
-        if (p[4] !== sub) continue;
-        const age = (t - p[5]) / LIFE_MS;
-        if (age >= 1) continue;
-        const [x, y] = toScreen(p[0], p[1]);
-        // 障碍点按强度增强半径
-        const rad = sub === 2 ? 1.4 + 2.6 * clamp(p[3], 0, 1) : st.w;
-        ctx.moveTo(x + rad, y);
-        ctx.arc(x, y, rad, 0, TAU);
-        n++;
-        if (n > MAX_PTS) break;
+function drawProfile(range) {
+  const view = state.points.filter(point => point[1] <= range && LAYERS[point[4]].visible);
+  const span = Math.max(1, Math.ceil(view.reduce((peak, point) => Math.max(peak, Math.abs(point[2])), 0)));
+  const left = 32;
+  const right = profileWidth - 6;
+  const top = 7;
+  const bottom = profileHeight - 15;
+  const middle = (top + bottom) / 2;
+  const chart = profileCtx;
+  chart.clearRect(0, 0, profileWidth, profileHeight);
+  if (profileWidth <= 50) return;
+  chart.strokeStyle = '#2c4359';
+  chart.beginPath();
+  chart.moveTo(left, top);
+  chart.lineTo(left, bottom);
+  chart.moveTo(left, middle);
+  chart.lineTo(right, middle);
+  chart.stroke();
+  chart.font = '10px ui-monospace, Consolas, monospace';
+  chart.fillStyle = '#92a9c1';
+  chart.textAlign = 'right';
+  chart.fillText('+' + span + 'm', left - 4, top + 4);
+  chart.fillText('−' + span + 'm', left - 4, bottom);
+  chart.fillText(range + ' m', right, profileHeight - 1);
+  chart.textAlign = 'left';
+  chart.fillText('0', left, profileHeight - 1);
+  for (const point of view) {
+    const x = left + point[1] / range * (right - left);
+    const y = middle - point[2] / span * (middle - top);
+    chart.fillStyle = LAYERS[point[4]].color;
+    chart.fillRect(x - 1, y - 1, 2, 2);
+  }
+}
+
+function schedulePlot() {
+  if (pendingDraw) return;
+  pendingDraw = true;
+  requestAnimationFrame(() => {
+    pendingDraw = false;
+    refreshPlot();
+  });
+}
+
+function refreshPlot() {
+  const t = now();
+  state.points = state.points.filter(point => t - point[5] < POINT_LIFE_MS);
+  state.omniPoints = state.omniPoints.filter(point => t - point[2] < POINT_LIFE_MS);
+  if (state.omniAt !== null && t - state.omniAt >= POINT_LIFE_MS) {
+    state.omniAt = null;
+    updateFeedBadges();
+  }
+  state.frameTimes = state.frameTimes.filter(stamp => t - stamp < 1000);
+  let peak = state.points.reduce((max, point) => Math.max(max, point[1]), 0);
+  if (OMNI_LAYER.visible) peak = state.omniPoints.reduce((max, point) => Math.max(max, point[1]), peak);
+  state.range = state.manualRange ?? (peak ? (RANGES.find(range => range >= peak * 1.04) ?? 50) : 10);
+  byId('range-foot').textContent = '量程 ' + state.range + ' m';
+  byId('stat-fps').textContent = state.pointPacket ? state.frameTimes.length + ' 帧/s' : '—';
+
+  drawGrid(state.range);
+  const visible = drawPoints(state.points, state.range);
+  drawProfile(state.range);
+  const feed = state.feeds.point_cloud;
+  byId('ppi-hint').hidden = visible > 0;
+  if (!visible && OMNI_LAYER.visible && state.omniAt !== null) {
+    byId('ppi-message').textContent = '当前视图没有可见回波';
+    byId('ppi-detail').textContent = '可切换图层或量程';
+  } else if (feed === 'stale') {
+    byId('ppi-message').textContent = '1E61 点云数据已过期';
+    byId('ppi-detail').textContent = '重新收到有效帧后自动恢复';
+  } else if (!state.pointPacket) {
+    byId('ppi-message').textContent = '等待 1E61 点云';
+    byId('ppi-detail').textContent = '收到有效数据后自动绘制';
+  } else if (!visible) {
+    byId('ppi-message').textContent = '当前视图没有可见点云';
+    byId('ppi-detail').textContent = peak ? '可切换图层或量程' : '最近收到的点云帧没有可绘制的回波';
+  }
+}
+
+function showProtocol(feed, packet) {
+  const ids = feed === 'point_cloud' ? ['proto-kv', 'proto-hex'] : ['avoid-proto-kv', 'avoid-proto-hex'];
+  const name = FEEDS[feed].toUpperCase();
+  let text = name + ' · ' + (state.feeds[feed] === 'stale' ? '数据已过期' : '等待数据');
+  if (packet) {
+    text = name + ' · seq ' + packet.seq + ' · ' + packet.len + ' B · CRC OK';
+    if (packet.count != null) text += ' · ' + packet.count + ' 点';
+  }
+  byId(ids[0]).textContent = text;
+  byId(ids[1]).textContent = packet?.hex || '';
+}
+
+function showTracks(tracks) {
+  const list = byId('trk-list');
+  const awaiting = !state.pointPacket;
+  byId('trk-count').textContent = awaiting ? '—' : tracks.length;
+  list.replaceChildren();
+  if (!tracks.length) {
+    const entry = document.createElement('li');
+    entry.className = 'empty';
+    entry.textContent = awaiting ? '等待点云' : '暂无确认航迹';
+    list.append(entry);
+    return;
+  }
+  for (const track of tracks.slice(0, 6)) {
+    const entry = document.createElement('li');
+    const label = document.createElement('span');
+    label.textContent = '#' + track.id;
+    if (track.status === 'coasting') {
+      const detail = document.createElement('small');
+      detail.className = 'track-coasting';
+      detail.textContent = '预测中';
+      label.append(detail);
+    }
+    entry.append(label);
+    for (const value of [track.range.toFixed(2) + ' m', track.az.toFixed(1) + '°']) {
+      const cell = document.createElement('span');
+      cell.textContent = value;
+      entry.append(cell);
+    }
+    list.append(entry);
+  }
+}
+
+function showAvoidance(data) {
+  const stale = state.feeds.avoidance === 'stale';
+  const active = data ? data.sectors.filter(sector => sector.valid) : [];
+  const nearest = active.reduce((best, sector) => best === null || sector.dist_cm < best.dist_cm ? sector : best, null);
+  byId('near-dist').textContent = nearest ? (nearest.dist_cm / 100).toFixed(2) : '—';
+  byId('near-az').textContent = nearest ? '方位 ' + nearest.az.toFixed(1) + '°'
+    : data ? '未报告有效距离' : stale ? '1E62 避障数据已过期' : '等待 1E62 避障结果';
+  byId('avoidance-card').classList.toggle('has-hit', nearest !== null);
+  byId('sector-count').textContent = (data ? active.length : '—') + ' / 16';
+
+  sectors.forEach((cell, index) => {
+    const sector = data?.sectors[index];
+    cell.classList.toggle('hit', Boolean(sector?.valid));
+    cell.classList.toggle('nearest', nearest !== null && nearest.index === index);
+    cell.title = '扇区 ' + (index + 1) + ' · ' + (sector?.valid
+      ? (sector.dist_cm / 100).toFixed(2) + ' m · ' + sector.az.toFixed(1) + '°'
+      : data ? '暂无有效距离' : '暂无数据');
+  });
+
+  const height = data?.height_kalman_cm;
+  const validHeight = data?.height_confidence > 0 && height > 0 && height < 10000;
+  byId('h-val').textContent = validHeight ? height : '—';
+  byId('h-sub').textContent = data ? '高度置信度 ' + data.height_confidence
+    : stale ? '数据已过期' : '等待 1E62';
+  showProtocol('avoidance', data?.proto);
+}
+
+function updateFeedBadges() {
+  for (const [feed, id] of Object.entries(FEEDS)) {
+    const value = state.feeds[feed];
+    const el = byId('feed-' + id);
+    el.className = 'feed-state ' + value;
+    el.textContent = { live: '收包正常', stale: '数据过期', waiting: '等待数据' }[value];
+  }
+  const feeds = Object.values(state.feeds);
+  if (feeds.every(value => value === 'live')) badge('badge-run', '雷达收包正常', 'on');
+  else if (feeds.includes('live')) badge('badge-run', '收到部分雷达数据', 'warn');
+  else if (state.omniAt !== null) badge('badge-run', '收到原始回波', 'on');
+  else if (feeds.includes('stale')) badge('badge-run', '雷达数据中断', 'warn');
+  else badge('badge-run', '等待雷达');
+}
+
+function setFeed(feed, status) {
+  state.feeds[feed] = status;
+  if (status === 'live') {
+    state.deadlines[feed] ||= now() + WATCHDOG_MS;
+    return;
+  }
+  state.deadlines[feed] = 0;
+  if (feed === 'point_cloud') {
+    state.points = [];
+    state.frameTimes = [];
+    state.pointPacket = null;
+    showTracks([]);
+    showProtocol(feed);
+    schedulePlot();
+  } else {
+    showAvoidance(null);
+  }
+}
+
+function notePacket(feed, age = 0) {
+  state.deadlines[feed] = now() + WATCHDOG_MS - age * 1000;
+  if (state.feeds[feed] !== 'live') {
+    state.feeds[feed] = 'live';
+    updateFeedBadges();
+  }
+}
+
+function statusUpdate(feeds, avoidance) {
+  for (const feed of Object.keys(FEEDS)) setFeed(feed, feeds[feed]);
+  if (avoidance && feeds.avoidance === 'live') {
+    notePacket('avoidance', avoidance.age_s || 0);
+    showAvoidance(avoidance);
+  }
+  updateFeedBadges();
+}
+
+function onPacket(message) {
+  switch (message.type) {
+    case 'radar_status':
+      statusUpdate(message.radar, message.avoidance);
+      break;
+    case 'avoidance':
+      notePacket('avoidance');
+      showAvoidance(message.avoidance);
+      break;
+    case 'tracks':
+      showTracks(message.tracks);
+      break;
+    case 'omni': {
+      const t = now();
+      const becameLive = state.omniAt === null;
+      state.omniAt = t;
+      for (const [az, distance] of message.points) state.omniPoints.push([az, distance, t]);
+      if (state.omniPoints.length > MAX_POINTS) state.omniPoints.splice(0, state.omniPoints.length - MAX_POINTS);
+      OMNI_LAYER.button.hidden = false;
+      if (becameLive) updateFeedBadges();
+      schedulePlot();
+      break;
+    }
+    case 'frame': {
+      notePacket('point_cloud');
+      const t = now();
+      state.frameTimes.push(t);
+      for (const point of message.points) {
+        if (LAYERS[point[4]]) state.points.push([...point, t]);
       }
-      if (n === 0) continue;
-      ctx.fillStyle = st.c;
-      ctx.fill();
+      if (state.points.length > MAX_POINTS) state.points.splice(0, state.points.length - MAX_POINTS);
+      state.pointPacket = message.proto;
+      showTracks(message.tracks);
+      showProtocol('point_cloud', message.proto);
+      schedulePlot();
+      break;
     }
   }
+}
 
-  function render() {
-    const t = now();
-    drawGrid();
-    drawPoints(t);
-    // 扫描角指示
-    const ang = S.lastAngle;
-    if (typeof ang === 'number' && S.running) {
-      const [x, y] = toScreen(ang, S.range);
-      const g = ctx.createLinearGradient(CX, CY, x, y);
-      g.addColorStop(0, 'rgba(45,212,191,0.06)');
-      g.addColorStop(1, 'rgba(45,212,191,0.30)');
-      ctx.beginPath();
-      ctx.strokeStyle = g;
-      ctx.lineWidth = 1.6;
-      ctx.moveTo(CX, CY);
-      ctx.lineTo(x, y);
-      ctx.stroke();
+function buildPlotControls() {
+  for (const range of [null, ...RANGES]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = range ? range + ' m' : '自动';
+    button.setAttribute('aria-pressed', String(range === null));
+    button.addEventListener('click', () => {
+      state.manualRange = range;
+      for (const [key, item] of rangeButtons) item.setAttribute('aria-pressed', String(key === range));
+      schedulePlot();
+    });
+    rangeButtons.set(range, button);
+    byId('ranges').append(button);
+  }
+  for (const layer of [...LAYERS, OMNI_LAYER]) {
+    const button = document.createElement('button');
+    const dot = document.createElement('i');
+    const count = document.createElement('b');
+    button.type = 'button';
+    button.setAttribute('aria-pressed', 'true');
+    dot.className = 'dot';
+    dot.style.setProperty('--dot', layer.color);
+    layer.count = count;
+    count.textContent = '0';
+    if (layer === OMNI_LAYER) {
+      layer.button = button;
+      button.id = 'layer-omni';
+      button.title = '侧阵原始 CFAR 回波（斜距）';
+      button.hidden = true;
+    }
+    button.append(dot, layer.label, count);
+    button.addEventListener('click', () => {
+      layer.visible = !layer.visible;
+      button.setAttribute('aria-pressed', String(layer.visible));
+      schedulePlot();
+    });
+    byId('legend').append(button);
+  }
+  for (let i = 0; i < 16; i++) {
+    const cell = document.createElement('span');
+    sectors.push(cell);
+    byId('sector-strip').append(cell);
+  }
+}
+
+let sendingMotor = false;
+async function refreshSetpoint() {
+  if (sendingMotor) return;
+  try {
+    const response = await fetch('/api/state');
+    const { motor_speed } = await response.json();
+    if (!sendingMotor) byId('rpm-val').textContent = motor_speed ?? '—';
+  } catch (_) {
+    // The SSE badge reports a dropped web connection.
+  }
+}
+
+byId('motor-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (sendingMotor || !form.reportValidity()) return;
+  const speed = byId('rpm').valueAsNumber;
+  const button = byId('motor-submit');
+  const output = byId('rpm-sub');
+  sendingMotor = true;
+  button.disabled = true;
+  output.textContent = '正在下发…';
+  try {
+    const response = await fetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'motor', value: speed }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.ok) throw new Error(result.error || '电机桥未确认指令');
+    byId('rpm-val').textContent = result.speed;
+    output.textContent = '已下发 ' + result.speed + ' rpm';
+  } catch (error) {
+    output.textContent = '下发失败：' + error.message;
+  } finally {
+    sendingMotor = false;
+    button.disabled = false;
+  }
+});
+
+buildPlotControls();
+showAvoidance(null);
+new ResizeObserver(resizePlot).observe(canvas.parentElement);
+resizePlot();
+const stream = new EventSource('/events');
+stream.onopen = () => {
+  badge('badge-conn', '网页已连接', 'on');
+  refreshSetpoint();
+};
+stream.onerror = () => {
+  badge('badge-conn', '网页重连中', 'warn');
+  state.omniAt = null;
+  state.omniPoints = [];
+  statusUpdate({ point_cloud: 'waiting', avoidance: 'waiting' });
+};
+stream.onmessage = (event) => {
+  try {
+    onPacket(JSON.parse(event.data));
+  } catch (error) {
+    console.warn('无法显示雷达数据', error);
+  }
+};
+
+function tick() {
+  byId('clock').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  for (const feed of Object.keys(FEEDS)) {
+    if (state.feeds[feed] === 'live' && now() >= state.deadlines[feed]) {
+      setFeed(feed, 'stale');
+      updateFeedBadges();
     }
   }
-
-  function prune(t) {
-    if (S.points.length > MAX_PTS) {
-      S.points.splice(0, S.points.length - MAX_PTS);
-    }
-    // 惰性清理：每 1s 清一次过期点
-    if (!prune.last || t - prune.last > 800) {
-      prune.last = t;
-      S.points = S.points.filter((p) => t - p[5] < LIFE_MS);
-    }
-  }
-
-  /* ── 俯仰剖面 ───────────────────────────────────── */
-  const ecl = $('elev');
-  const ectx = ecl.getContext('2d');
-
-  function drawElev() {
-    const w = ecl.parentElement.clientWidth - 24;
-    const h = 62;
-    ecl.width = Math.round(w * DPR);
-    ecl.height = Math.round(h * DPR);
-    ecl.style.width = w + 'px';
-    ecl.style.height = h + 'px';
-    ectx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    ectx.clearRect(0, 0, w, h);
-
-    // 以雷达高度为中线，纵轴 ±60cm 的 z 分布（按距离分箱）
-    const NB = 40;
-    const bins = new Array(NB).fill(0);
-    for (const p of S.points) {
-      if (p[4] === 0) continue;          // 地面点不参与剖面
-      const b = clamp(Math.floor((p[1] / S.range) * NB), 0, NB - 1);
-      bins[b] += 1;
-    }
-    const mx = Math.max(1, ...bins);
-    const bw = w / NB;
-    for (let i = 0; i < NB; i++) {
-      if (!bins[i]) continue;
-      const bh = (bins[i] / mx) * (h - 10);
-      ectx.fillStyle = 'rgba(61,220,132,0.55)';
-      ectx.fillRect(i * bw + 0.5, h - bh - 1, Math.max(1, bw - 1), bh);
-    }
-    // 基线
-    ectx.strokeStyle = 'rgba(90,110,135,0.25)';
-    ectx.beginPath();
-    ectx.moveTo(0, h - 0.5);
-    ectx.lineTo(w, h - 0.5);
-    ectx.stroke();
-  }
-
-  /* ── 帧处理 ─────────────────────────────────────── */
-  function onFrame(f) {
-    if (!f || f.type === 'error') return;
-
-    if (f.source === 'udp') {
-      if (S.udpEpoch !== null && S.udpEpoch !== f.data_epoch) clearUdpHistory();
-      S.udpEpoch = f.data_epoch ?? null;
-      setUdpStatus(f.data_status);
-      if (f.data_status !== 'live') return;
-    } else {
-      S.running = f.running;
-      S.heightCm = f.height_cm ?? null;
-      $('h-val').textContent = S.heightCm ?? '—';
-      syncRunBtn();
-    }
-    S.lastAngle = f.angle;
-    if (f.rpm != null) S.motor.value = f.rpm;
-
-    const t = now();
-    const pts = f.points || [];
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      // p = [az, r, z, snr, sub]
-      S.points.push([p[0], p[1], p[2], p[3], p[4] | 0, t]);
-      S.total++;
-    }
-    prune(t);
-    S.tracks = f.tracks || [];
-    S.proto = f.proto || null;
-
-    // 自动量程：有点贴近边缘就升档
-    if (pts.length) {
-      let maxR = 0;
-      for (const p of pts) if (p[1] > maxR) maxR = p[1];
-      if (maxR > S.range * 0.96) {
-        const next = RANGES.find((r) => r > maxR * 1.04);
-        if (next && next > S.range) setRange(next);
-      }
-    }
-    updateUI(f);
-  }
-
-  function updateUI(f = {}) {
-    // 统计
-    const t = now();
-    if (f.type === 'frame') S.marks.push([t, (f.points || []).length]);
-    while (S.marks.length && t - S.marks[0][0] > 1000) S.marks.shift();
-    const fps = S.marks.length;
-    let pps = 0;
-    for (const m of S.marks) pps += m[1];
-
-    let ng = 0, nw = 0, np = 0;
-    for (const p of S.points) {
-      if (p[4] === 0) ng++; else if (p[4] === 1) nw++; else np++;
-    }
-    $('ppi-stat').textContent =
-      `点 ${S.points.length} · ${pps} pts/s · 地${ng} 线${nw} 障${np}`;
-    $('stat-fps').textContent = `${fps} 帧/s · ${S.total} 点累计`;
-
-    // 最近障碍（只认 pcla）
-    let best = null;
-    for (const p of S.points) {
-      if (p[4] !== 2) continue;
-      if (!best || p[1] < best[1]) best = p;
-    }
-    if (best) {
-      $('near-dist').textContent = best[1].toFixed(2);
-      const height = S.heightCm == null
-        ? `相对雷达 ${best[2].toFixed(2)} m`
-        : `离地 ${(S.heightCm / 100 + best[2]).toFixed(2)} m`;
-      $('near-az').textContent = `方位 ${best[0].toFixed(1)}° · ${height}`;
-    } else {
-      $('near-dist').textContent = '—';
-      $('near-az').textContent = S.udpStatus && S.udpStatus !== 'live'
-        ? '暂无雷达数据'
-        : '暂无障碍点';
-    }
-
-    // 航迹
-    const tr = S.tracks || [];
-    $('trk-count').textContent = tr.length;
-    const ul = $('trk-list');
-    if (!tr.length) {
-      ul.innerHTML = '<li class="empty">无确认航迹</li>';
-    } else {
-      ul.innerHTML = tr.slice(0, 6).map((k) =>
-        `<li><span>#${k.id ?? '—'}</span><span>${(k.range ?? k.dist ?? k.r)?.toFixed(2) ?? '—'} m</span><span>${(k.az ?? 0).toFixed?.(0) ?? '—'}°</span></li>`
-      ).join('');
-    }
-
-    // 协议帧
-    const p = f.proto;
-    $('proto-kv').textContent = p
-      ? `${p.msg} · seq ${p.seq} · ${p.len} B · ${p.count} 点 · CRC ${p.crc_ok ? 'OK' : '—'}`
-      : '—';
-    $('proto-hex').textContent = p?.hex || '';
-    setBadge($('badge-crc'), p?.crc_ok ? 'CRC OK' : 'CRC —', p?.crc_ok ? 'on' : '');
-
-    $('ppi-hint').classList.toggle('hide', !S.udpStatus || S.udpStatus === 'live');
-    drawElev();
-  }
-
-  /* ── 事件绑定 ───────────────────────────────────── */
-  function setRange(r) {
-    S.range = r;
-    for (const b of $('ranges').children) {
-      b.classList.toggle('active', Number(b.dataset.r) === r);
-    }
-    $('range-foot').textContent = `0 – ${r} m`;
-  }
-
-  function buildRanges() {
-    const box = $('ranges');
-    box.innerHTML = '';
-    for (const r of RANGES) {
-      const b = document.createElement('button');
-      b.textContent = r + ' m';
-      b.dataset.r = r;
-      b.onclick = () => setRange(r);
-      box.appendChild(b);
-    }
-    setRange(S.range);
-  }
-
-  async function control(action, value) {
-    try {
-      const r = await fetch('/api/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, value }),
-      });
-      return await r.json();
-    } catch (e) {
-      return { ok: false, error: String(e) };
-    }
-  }
-
-  function bindControls() {
-    $('btn-run').onclick = async () => {
-      const action = S.running ? 'stop' : 'start';
-      const res = await control(action);
-      if (res && res.ok !== false) {
-        S.running = !S.running;
-        syncRunBtn();
-      }
-    };
-
-    const rpm = $('rpm');
-    const rpmLabel = $('rpm-label');
-    rpm.oninput = () => { rpmLabel.textContent = rpm.value; };
-    rpm.onchange = async () => {
-      const v = Number(rpm.value);
-      S.motor.value = v;
-      S.motor.status = 'sending';
-      rpmLabel.textContent = v;
-      $('rpm-val').textContent = v;
-      $('rpm-sub').textContent = '正在下发…';
-      const res = await control('motor', v);
-      if (res && res.ok) {
-        S.motor.status = 'ok';
-        $('rpm-sub').textContent = `已下发 ${v} rpm${res.dry ? '（dry-run）' : ''}`;
-      } else {
-        S.motor.status = 'err';
-        $('rpm-sub').textContent = '下发失败：' + (res && (res.error || res.err) || '未知错误');
-      }
-    };
-
-    const h = $('height');
-    h.oninput = () => {
-      S.heightCm = Number(h.value);
-      $('h-label').textContent = S.heightCm;
-      $('h-val').textContent = S.heightCm;
-    };
-    h.onchange = () => control('height', S.heightCm);
-
-    $('scene').onchange = (e) => {
-      S.scene = e.target.value;
-      control('scene', S.scene);
-    };
-  }
-
-  function setUdpStatus(status = 'waiting') {
-    if (S.udpStatus === status) return;
-    S.src = 'UDP';
-    S.udpStatus = status;
-    S.running = null;
-    S.heightCm = null;
-    $('badge-src').textContent = S.src;
-    $('btn-run').disabled = true;
-    $('height').disabled = true;
-    $('scene').disabled = true;
-    $('h-val').textContent = '—';
-    $('h-label').textContent = '—';
-    $('h-sub').textContent = '1E61 未提供雷达离地高度';
-    syncRunBtn();
-    if (status === 'live') return;
-
-    clearUdpHistory();
-    $('ppi-hint').textContent = status === 'stale' ? '雷达数据超时' : '等待雷达数据…';
-    updateUI();
-  }
-
-  function clearUdpHistory() {
-    S.points = [];
-    S.tracks = [];
-    S.marks = [];
-    S.proto = null;
-    S.lastAngle = null;
-  }
-
-  function syncRunBtn() {
-    const b = $('btn-run');
-    if (S.udpStatus) {
-      b.textContent = '真机接收';
-      const text = { waiting: '等待雷达数据', live: '雷达数据正常', stale: '雷达数据超时' };
-      setBadge($('badge-run'), text[S.udpStatus], S.udpStatus === 'live' ? 'on' : 'warn');
-      return;
-    }
-    b.textContent = S.running ? '停止' : '启动';
-    b.classList.toggle('stopping', S.running);
-    setBadge($('badge-run'), S.running ? '运行中' : '已停止', S.running ? 'on' : '');
-  }
-
-  /* ── SSE ────────────────────────────────────────── */
-  function connect() {
-    const es = new EventSource('/events');
-    es.onopen = () => {
-      S.connected = true;
-      setBadge($('badge-conn'), '已连接', 'on');
-    };
-    es.onerror = () => {
-      S.connected = false;
-      setBadge($('badge-conn'), '重连中', 'warn');
-      if (S.src === 'UDP') setUdpStatus('waiting');
-    };
-    es.onmessage = (ev) => {
-      try { onFrame(JSON.parse(ev.data)); } catch (_) { /* 忽略坏帧 */ }
-    };
-  }
-
-  async function bootstrap() {
-    buildRanges();
-    bindControls();
-    resize();
-    window.addEventListener('resize', () => { resize(); drawElev(); });
-
-    try {
-      const st = await (await fetch('/api/state')).json();
-      S.running = !!st.running;
-      S.src = (st.source || '—').toUpperCase();
-      $('badge-src').textContent = S.src;
-      if (st.source === 'udp') setUdpStatus(st.data_status);
-      const lastSpeed = st.motor_speed != null ? st.motor_speed : st.rpm;
-      if (lastSpeed != null) {
-        S.motor.value = lastSpeed;
-        $('rpm').value = clamp(lastSpeed, 0, 1800);
-        $('rpm-label').textContent = lastSpeed;
-        $('rpm-val').textContent = lastSpeed;
-        $('rpm-sub').textContent = '已下发 ' + lastSpeed + ' rpm · 拖动滑块可改';
-      } else {
-        $('rpm-val').textContent = '—';
-        $('rpm-sub').textContent = '尚未下发 · 拖动滑块可设定';
-      }
-      if (st.height_cm != null) {
-        S.heightCm = st.height_cm;
-        $('height').value = S.heightCm;
-        $('h-label').textContent = S.heightCm;
-        $('h-val').textContent = S.heightCm;
-      }
-      setBadge($('badge-crc'), st.crc_ok ? 'CRC OK' : 'CRC —', st.crc_ok ? 'on' : '');
-    } catch (_) { /* state 拿不到不致命 */ }
-
-    syncRunBtn();
-    connect();
-
-    // 时钟
-    const tick = () => {
-      const d = new Date();
-      $('clock').textContent = d.toTimeString().slice(0, 8);
-    };
-    tick();
-    setInterval(tick, 1000);
-
-    // 转速状态轮询：外部（脚本/其它客户端）改了速度时同步显示
-    setInterval(async () => {
-      if (document.activeElement === $('rpm')) return; // 正在拖动时不覆盖
-      try {
-        const st = await (await fetch('/api/state')).json();
-        const lastSpeed = st.motor_speed != null ? st.motor_speed : st.rpm;
-        if (lastSpeed != null && Number(lastSpeed) !== Number($('rpm').value)) {
-          S.motor.value = lastSpeed;
-          $('rpm').value = clamp(lastSpeed, 0, 1800);
-          $('rpm-label').textContent = lastSpeed;
-          $('rpm-val').textContent = lastSpeed;
-          $('rpm-sub').textContent = '已下发 ' + lastSpeed + ' rpm · 拖动滑块可改';
-        }
-      } catch (_) { /* 忽略 */ }
-    }, 3000);
-
-    // 渲染循环
-    (function loop() {
-      render();
-      requestAnimationFrame(loop);
-    })();
-  }
-
-  document.addEventListener('DOMContentLoaded', bootstrap);
-})();
+}
+tick();
+setInterval(tick, 1000);
+setInterval(() => { if (state.pointPacket || state.omniAt !== null) schedulePlot(); }, 300);
+setInterval(refreshSetpoint, 5000);

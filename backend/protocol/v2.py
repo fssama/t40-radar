@@ -22,7 +22,6 @@
 """
 from __future__ import annotations
 
-import math
 import struct
 from dataclasses import dataclass
 
@@ -42,9 +41,6 @@ EP_BLACKBOX = (0x1D, 0x00)
 SUBTYPE_GROUND = 0
 SUBTYPE_WIRE = 1
 SUBTYPE_PCLA = 2
-
-PERCEPTION_HEADER_LEN = 69
-PERCEPTION_RECORD = struct.Struct("<HfffH")
 
 
 @dataclass
@@ -71,35 +67,7 @@ class V2Frame:
         }
 
 
-def build_v2(msg: int, payload: bytes, seq: int = 0,
-             ep1: int | None = None, ep2: int | None = None) -> bytes:
-    if ep1 is None or ep2 is None:
-        d1, d2 = EP_PERCEPTION if msg == MSG_PERCEPTION else EP_BLACKBOX
-        ep1 = d1 if ep1 is None else ep1
-        ep2 = d2 if ep2 is None else ep2
-
-    total = HEADER_LEN + len(payload) + TAIL_LEN
-    if total > 0xFFFF:
-        raise ValueError(f"V2 frame too large: {total}")
-
-    buf = bytearray(total)
-    buf[0] = SOF
-    buf[1] = 0x18
-    buf[2] = 0x08
-    struct.pack_into("<H", buf, 3, total)
-    struct.pack_into("<I", buf, 7, seq & 0xFFFFFFFF)
-    struct.pack_into("<H", buf, 12, ep1)
-    struct.pack_into("<H", buf, 18, ep2)
-    buf[23] = crc8(bytes(buf[0:23]))
-    buf[24] = (msg >> 8) & 0xFF
-    buf[25] = msg & 0xFF
-    buf[27:27 + len(payload)] = payload
-    struct.pack_into("<H", buf, total - 2, crc16(bytes(buf[0:total - 2])))
-    return bytes(buf)
-
-
 def parse_v2(buf: bytes) -> V2Frame:
-    """Parse framing and expose CRC16 status for callers that inspect raw frames."""
     if len(buf) < HEADER_LEN + TAIL_LEN:
         raise ValueError(f"V2 frame too short: {len(buf)}")
     if buf[0] != SOF:
@@ -147,53 +115,28 @@ class Record1E61:
     z: float
     metric: int
 
-    def pack(self) -> bytes:
-        return PERCEPTION_RECORD.pack(self.id & 0xFFFF, self.x, self.y, self.z,
-                                      self.metric & 0xFFFF)
-
-    @classmethod
-    def from_metres(cls, rid: int, x: float, y: float, z: float, metric: int) -> Record1E61:
-        return cls(rid, x / UNIT_DM, y / UNIT_DM, z / UNIT_DM, metric)
-
     @property
     def az(self) -> float:
+        import math
         return math.degrees(math.atan2(self.y, self.x)) % 360.0
 
     @property
     def rng(self) -> float:
-        return math.hypot(self.x, self.y) * UNIT_DM
-
-
-def build_1e61(records: list[Record1E61], subtype: int = SUBTYPE_PCLA,
-               seq: int = 0, flags: int = 0x00) -> bytes:
-    """打包 1E61 payload。头里 +3=记录数、+5=flags、+65=subtype。"""
-    if len(records) > 0xFFFF:
-        raise ValueError(f"1E61 too many records: {len(records)}")
-    hdr = bytearray(PERCEPTION_HEADER_LEN)
-    hdr[0] = seq & 0xFF
-    hdr[1] = (seq >> 8) & 0xFF
-    hdr[2] = (seq >> 16) & 0xFF
-    struct.pack_into("<H", hdr, 3, len(records))
-    hdr[5] = flags
-    struct.pack_into("<H", hdr, 65, subtype & 0xFFFF)
-    body = b"".join(r.pack() for r in records)
-    return bytes(hdr) + body
+        import math
+        return math.sqrt(self.x ** 2 + self.y ** 2) * UNIT_DM
 
 
 def parse_1e61(payload: bytes) -> dict:
-    if len(payload) < PERCEPTION_HEADER_LEN:
+    if len(payload) < 69:
         raise ValueError(f"1E61 payload too short: {len(payload)}")
-    n = struct.unpack_from("<H", payload, 3)[0]
+    n = payload[3] | (payload[4] << 8)
     subtype = struct.unpack_from("<H", payload, 65)[0]
-    expected = PERCEPTION_HEADER_LEN + n * PERCEPTION_RECORD.size
-    if len(payload) != expected:
-        raise ValueError(f"1E61 count/length mismatch: {n} records, expected {expected} B, got {len(payload)} B")
-
+    body = payload[69:]
+    if len(body) != n * 16:
+        raise ValueError(f"1E61 record count mismatch: {n} records, {len(body)} bytes")
     recs = []
-    body = memoryview(payload)[PERCEPTION_HEADER_LEN:]
-    for rid, x, y, z, metric in PERCEPTION_RECORD.iter_unpack(body):
-        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
-            raise ValueError("1E61 non-finite coordinate")
+    for i in range(n):
+        rid, x, y, z, metric = struct.unpack_from("<HfffH", body, i * 16)
         recs.append(Record1E61(rid, x, y, z, metric))
     return {"subtype": subtype, "count": n, "records": recs}
 
@@ -202,65 +145,25 @@ def parse_1e61(payload: bytes) -> dict:
 # 0x1E62 / 0x1E32 fusion avoidance：116 B
 # --------------------------------------------------------------------------
 
-def build_1e62(sectors: list[tuple[int, int, int]] | None = None,
-               height_kalman_cm: int = 10000,
-               height_filtered_cm: int = 10000,
-               height_confidence: int = 0,
-               btm_avoid_cm: int = 10000,
-               up_avoid_cm: int = 10000,
-               counter: int = 0) -> bytes:
-    """构建 116 B 融合避障结果。
-
-    sectors: [(az_centideg, el_centideg, dist_cm)] × 16，缺省补"无障碍"项。
-    扇区项 6 B 布局按逆向笔记：+0 header / +1..2 az / +3..4 el / +5 dist 低字节，
-    dist 高字节落在下一项 +0（最后一项的高字节置 0）。
-    """
-    buf = bytearray(116)
-    buf[0] = 6
-    struct.pack_into("<H", buf, 4, btm_avoid_cm)
-    struct.pack_into("<H", buf, 6, up_avoid_cm)
-
-    if not sectors:
-        sectors = [(9000, 0, 10000)] * 16
-    sectors = list(sectors)[:16]
-    while len(sectors) < 16:
-        sectors.append((9000, 0, 10000))
-
-    dists = [s[2] for s in sectors]
-    for i, (az, el, dist) in enumerate(sectors):
-        off = 8 + 6 * i
-        # +0 存上一项距离的高字节；第一项是 header 0x10
-        buf[off] = 0x10 if i == 0 else ((dists[i - 1] >> 8) & 0xFF)
-        struct.pack_into("<H", buf, off + 1, az & 0xFFFF)
-        struct.pack_into("<H", buf, off + 3, el & 0xFFFF)
-        buf[off + 5] = dist & 0xFF
-
-    buf[104] = counter & 0xFF
-    struct.pack_into("<H", buf, 105, height_kalman_cm & 0xFFFF)
-    struct.pack_into("<H", buf, 107, height_filtered_cm & 0xFFFF)
-    struct.pack_into("<H", buf, 109, height_confidence & 0xFFFF)
-    return bytes(buf)
-
-
 def parse_1e62(payload: bytes) -> dict:
-    if len(payload) < 116:
-        raise ValueError(f"1E62 payload too short: {len(payload)}")
+    if len(payload) != 116:
+        raise ValueError(f"wrong 1E62 payload size: {len(payload)}")
+    if payload[0] != 6 or payload[8] != 16:
+        raise ValueError("bad 1E62 header")
     sectors = []
     for i in range(16):
-        off = 8 + 6 * i
-        az = struct.unpack_from("<H", payload, off + 1)[0]
-        el = struct.unpack_from("<H", payload, off + 3)[0]
-        dist_lo = payload[off + 5]
-        dist_hi = payload[off + 6] if i < 15 else 0
-        sectors.append({"az": az / 100.0, "el": el / 100.0,
-                        "dist_cm": (dist_hi << 8) | dist_lo})
+        az, el, dist = struct.unpack_from("<HHH", payload, 9 + 6 * i)
+        sectors.append({"index": i, "az": az / 100.0, "el": el / 100.0,
+                        "dist_cm": dist, "valid": 0 < dist < 10000})
     return {
         "marker": payload[0],
         "btm_avoid_cm": struct.unpack_from("<H", payload, 4)[0],
         "up_avoid_cm": struct.unpack_from("<H", payload, 6)[0],
-        "counter": payload[104],
+        "status_flags": struct.unpack_from("<H", payload, 2)[0],
+        "active_sectors": sum(s["valid"] for s in sectors),
         "height_kalman_cm": struct.unpack_from("<H", payload, 105)[0],
-        "height_filtered_cm": struct.unpack_from("<H", payload, 107)[0],
-        "height_confidence": struct.unpack_from("<H", payload, 109)[0],
+        "height_filtered_cm": struct.unpack_from("<h", payload, 107)[0],
+        "height_confidence": payload[109],
+        "counter": payload[115],
         "sectors": sectors,
     }

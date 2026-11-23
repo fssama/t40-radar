@@ -68,8 +68,8 @@ RD2484R 是 DJI Agras T40 的避障雷达，装在机身下方，由两半组成
 | 顶阵热图（32×64 float32） | ✅ 通 | `radar_streamer top` 读内存 → UDP 9876 |
 | 顶阵 AGL 高度 / 峰值点 | ✅ 通 | 实测 `AGL dist=1.40m`、峰值 `r=1.33/3.58m` |
 | 侧面点云（1E61） | ✅ 通 | 900 rpm 下 **~1250–1479 pts/s**，每帧 84–98 点 |
-| 侧面避障结果（1E62） | ✅ 通 | `btm=1.41m active_sectors=1/16` |
-| 转速控制（前端→CAN） | ✅ 通 | 前端滑块 → 后端 → VM 桥 → `duml_can_tool` → ESC |
+| 侧面避障结果（1E62） | ✅ 通 | 200 rpm 台架抓包收到 1E62，真实有效扇区为 `0/16` |
+| 转速控制（前端→CAN） | ✅ 通 | 前端提交 → 后端 → VM 桥 → `duml_can_tool` → ESC |
 | 原始 CFAR ring（0x1C100000） | ⬜ 未接 | 作者有 `radar_streamer side`，帧 60632 B |
 | FFT 复数输出（0x1C900000） | ⬜ 未做 | 作者也没进展，格式未知 |
 | 任意波形注入 | ❌ 不可行 | FPGA 固件闭源，无注入路径 |
@@ -120,7 +120,7 @@ RD2484R 是 DJI Agras T40 的避障雷达，装在机身下方，由两半组成
 | 数据接入 | 直接读 UDP 9876/9877（同一台 Linux） | VM 里转发 → Windows 后端解析 40204 |
 | 驱动 patch | 6 处 | 6 处 + **2 处本地 hack**（见 §5.3） |
 | 1E61 单位 | 字段名写作 `_m`（米） | **实测为分米，乘 0.1**（见 §9.2） |
-| 转速控制 | 命令行 `duml_can_tool` | 前端滑块 → HTTP → UDP 桥 |
+| 转速控制 | 命令行 `duml_can_tool` | 前端提交 → HTTP → UDP 桥 |
 
 ---
 
@@ -260,7 +260,8 @@ A5 是 CC1 触点，只能过几百 mA。让 12–18 W 的电流从 CC 触点回
 - CAN 需要 SocketCAN + `slcand`
 - Windows 原生两个都不行
 
-历史实测使用 VMware 内的 Ubuntu 25.10 和 `6.17.0-41-generic`。当前部署入口见 [Agent 部署工作流](AGENT-DEPLOY.md)，按目标内核编译并验证驱动。Windows 可以作为监视器或浏览器宿主。
+本文档的环境：**VMware 里的 Ubuntu 25.10**（内核 `6.17.0-41-generic`，已 hold 住不升级）。
+主机 Windows 只跑前端，不直接碰硬件。
 
 ### 5.2 基础环境清单
 
@@ -308,7 +309,21 @@ struct wmi_connect_event {
    return 0;
    ```
 
-**持久选择补丁版**见 [Agent 部署工作流](AGENT-DEPLOY.md#3-分层验收与故障处理)。驱动装入当前内核的 `updates/t40-radar/`，分别验证 `modinfo -n` 解析路径和两个已加载模块的 `srcversion`。前者是下次加载的候选，后者才代表当前正在运行的构建。旧环境曾记录补丁版 core 为 `F2F6840BB20AAEAE7361468`、旧版为 `6D77789D37DFD186B50EF1E`，这些历史值不可用于判定其他内核的构建。
+**加载新驱动**（每次开机或 USB 重插后都要）：
+
+```bash
+cd ~/work/dji-agras-radar/ar1021x_driver
+echo ubuntu | sudo -S -p '' make load
+```
+
+验证：
+
+```bash
+cat /sys/module/ath6kl_core/srcversion
+# 期望 F2F6840BB20AAEAE7361468（带补丁）
+# 若为 6D77789D37DFD186B50EF1E = 系统从 /lib/modules/.../updates 加载了旧的无补丁版本
+dmesg | grep -E 'ATH6KL_AUTHORIZE|ATH6KL_UNAUTHZ_SKIP'
+```
 
 ### 5.4 起 AP 并等雷达连上
 
@@ -348,11 +363,13 @@ sudo ~/work/venv/bin/python duml_can_tool.py send motor-speed --speed 900 --seq 
 # 回显 pay=84 03（0x0384 = 900）
 ```
 
-### 5.6 假飞控（关键，决定侧阵是否工作）
+### 5.6 假飞控与 1E62 转发
+
+先把仓库的 `tools/radar_avoidance_relay.py` 复制到 VM 的 `/tmp/`。
 
 ```bash
-setsid nohup ~/work/venv/bin/python ~/work/dji-agras-radar/radar_client/radar_min_client.py \
-    --flight-mode 2 --v2-local-port 40205 > /tmp/rmc.log 2>&1 &
+setsid nohup ~/work/venv/bin/python /tmp/radar_avoidance_relay.py \
+    ~/work/dji-agras-radar/radar_client 192.168.59.1 > /tmp/rmc.log 2>&1 &
 ```
 
 > 🔴 **绝对不要加 `--can-bridge can0`。**
@@ -360,14 +377,7 @@ setsid nohup ~/work/venv/bin/python ~/work/dji-agras-radar/radar_client/radar_mi
 > 电机立刻冲 900 —— 这就是「雷达飞出去」的真正机制。
 > `--flight-mode 2` 走 UDP 50007，不需要 CAN 桥。
 
-日志里应该能看到：
-
-```
-[rx/v1] msg=0x1E62(avoidance_result_fc) len=116 ...
-type=6 ver=0 flags=0x0005 btm=1.41m up=100.00m height=0.00m(kalman) conf=0 active_sectors=1/16
-[rx/v1] msg=0x1E32(avoidance_result_alt) len=116 ...
-```
-
+启动后先检查日志中的转发目的地址，再在网页的「数据链路」查看 1E62 是否收到。
 ---
 
 ## 6. 每次上电后的启动流程
@@ -382,15 +392,37 @@ type=6 ver=0 flags=0x0005 btm=1.41m up=100.00m height=0.00m(kalman) conf=0 activ
 | 4 | VM | `sudo ./start_ap.sh` | hostapd `state=ENABLED` |
 | 5 | VM | 等 45–60 s，`ping 192.168.8.2` | 3/3 |
 | 6 | VM | `slcand` + `ip link set can0 up` | `can0 UP` |
-| 7 | VM | `radar_min_client.py --flight-mode 2` | 日志有 1E62/1E32 |
-| 8 | VM | `duml_can_tool.py send motor-speed --speed 900` | `cur_speed` 收敛 900 |
+| 7 | VM | 启动 `radar_avoidance_relay.py` | 网页收到 1E62 |
+| 8 | 现场 | 如需采集旋转点云，单独通过 CAN 手动设速 | ESC `cur_speed` 回报实际转速 |
 | 9 | VM | `python3 /tmp/fwd.py`（40204 转发） | 日志 `fwd #1 ... from 192.168.8.2:40204` |
-| 10 | Windows | `python run.py --port 8010 --source udp` | 页面出现点云 |
+| 10 | Windows | `python run.py --port 8010` | 页面出现点云 |
 
-### 6.2 Agent 自动部署
+### 6.2 一键脚本（建议）
 
-新部署使用 [Agent 部署工作流](AGENT-DEPLOY.md)。它处理应用服务、当前内核的 AR1021x 驱动、USB 热插拔 AP 和可选 UDP 飞控服务。启用 UDP 飞控时，监视器使用 40204，客户端使用 40205。真机部署完成后，由分层检查记录 USB、AP、关联和有效 1E61 的各自状态。
+VM 侧 `~/start_all.sh`：
 
+```bash
+#!/bin/bash
+cd ~/work/dji-agras-radar/ar1021x_driver
+echo ubuntu | sudo -S -p '' make load
+sudo ip link set wlx00037f2044d2 up
+sudo ip addr add 192.168.8.1/24 dev wlx00037f2044d2 2>/dev/null
+cd ~/work/dji-agras-radar/setup && sudo ./start_ap.sh
+sleep 50
+sudo slcand -o -c -s8 /dev/ttyACM0 can0
+sudo ip link set can0 up
+setsid nohup ~/work/venv/bin/python /tmp/radar_avoidance_relay.py \
+    ~/work/dji-agras-radar/radar_client 192.168.59.1 > /tmp/rmc.log 2>&1 &
+setsid nohup python3 /tmp/fwd.py > /tmp/fwd.log 2>&1 &
+setsid nohup sudo /home/ubuntu/work/venv/bin/python /tmp/motor_bridge.py > /tmp/mb.log 2>&1 &
+```
+
+Windows 侧：
+
+```bat
+cd E:\dsh\t40-radar
+python run.py --port 8010
+```
 
 ### 6.3 转速门槛（实测，务必知道）
 
@@ -411,111 +443,19 @@ type=6 ver=0 flags=0x0005 btm=1.41m up=100.00m height=0.00m(kalman) conf=0 activ
 
 ## 7. 前后端代码结构
 
-### 7.1 后端（`backend/`，纯标准库，零依赖）
+### 7.1 后端（纯 Python 标准库）
 
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `run.py` | 76 | 启动入口，解析 `--host/--port/--source/--open` |
-| `backend/app.py` | 365 | `RadarApp`：tick 线程、SSE 广播、`UdpSource`、`ingest_udp()`、`set_motor()` |
-| `backend/server.py` | 226 | `ThreadingHTTPServer` + SSE + 控制 API |
-| `backend/track.py` | 265 | DBSCAN 聚类 + α-β 滤波（吃滑动窗口点云） |
-| `backend/protocol/v2.py` | 254 | V2 帧、1E61、1E62 的打包/解析、**`UNIT_DM = 0.1`** |
-| `backend/protocol/duml.py` | 121 | V1/DUML 帧 + CAN 分块 |
-| `backend/protocol/crc.py` | 23 | CRC8（init 0x77 / poly 0x8C）、CRC16（init 0x3692 / poly 0x8408） |
-| `backend/protocol/crc_tables.py` | 55 | 从作者 ROM 表抽取的查表 |
-| `backend/sim/radar.py` | 287 | 模拟器：场景几何 + 射线投射 + 扫描 |
+| 文件 | 职责 |
+|---|---|
+| `run.py` | 监听 UDP 和 HTTP，管理退出时的套接字清理 |
+| `backend/app.py` | 校验与解码实机帧，维护航迹与独立的链路时效 |
+| `backend/server.py` | 静态页面、SSE、实机状态和电机控制接口 |
+| `backend/protocol/` | DUML V1/V2、CRC、1E61 和 1E62 解码 |
+| `backend/track.py` | 点云聚类和航迹更新 |
 
-**关键代码：1E61 单位修正**（`protocol/v2.py`）
+### 7.2 前端（无框架）
 
-```python
-# 1E61 的 x/y/z 原始数值实测为分米（0.1 m）单位：
-#   实测帧点 x/y 落在 12–50，除 10 后 1.2–5.0 m，与 5 m 见方的室内场地吻合；
-#   ground 点 z 落在 -4.1–0，除 10 后 -0.41–0 m，正好贴地平面 z≈0；
-#   wire 点 z=1.545，除 10 后 0.15 m，线缆垂在雷达下方 15 cm。
-UNIT_DM = 0.1
-
-@dataclass
-class Record1E61:
-    id: int
-    x: float
-    y: float
-    z: float
-    metric: int
-
-    @property
-    def rng(self) -> float:
-        return math.sqrt(self.x ** 2 + self.y ** 2) * UNIT_DM
-```
-
-**关键代码：转速控制**（`app.py` → `set_motor`）
-
-```python
-def set_motor(self, speed: float, dry: bool = False) -> dict:
-    addr = os.environ.get("T40_MOTOR_BRIDGE", "192.168.59.140:50009")
-    host, _, port = addr.partition(":")
-    payload = json.dumps({"speed": max(0, min(1800, int(round(speed)))), "dry": dry}).encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(5.0)
-    try:
-        sock.sendto(payload, (host, int(port or 50009)))
-        data, _ = sock.recvfrom(8192)
-        res = json.loads(data.decode("utf-8", "replace"))
-        if res.get("ok"):
-            self.last_motor = speed
-            self._save_motor(speed)      # 持久化到 .motor_state，重启不丢
-        return res
-    except socket.timeout:
-        return {"ok": False, "error": f"motor bridge timeout ({addr})"}
-    finally:
-        sock.close()
-```
-
-### 7.2 前端（`frontend/`，无框架、无构建）
-
-| 文件 | 行数 | 职责 |
-|---|---|---|
-| `frontend/index.html` | 135 | DOM 结构（暗色监控风） |
-| `frontend/style.css` | 456 | 主题变量、grid 布局、面板样式 |
-| `frontend/app.js` | 488 | Canvas PPI 渲染、SSE 消费、控制交互 |
-
-**核心渲染逻辑**（`app.js`）：
-
-```js
-const RANGES = [5, 10, 20, 50];
-const LIFE_MS = 4000;
-
-// 三种 subtype 分三遍画：地面最底、障碍最上
-const SUB_STYLE = [
-  { c: 'rgba(120,155,195,0.45)', w: 2.8, name: '地面' },
-  { c: 'rgba(240,180,41,0.95)',  w: 3.8, name: '线缆' },
-  { c: 'rgba(61,220,132,1.0)',   w: 4.6, name: '障碍' },
-];
-
-// 0° 朝上、顺时针；r 是米
-const toScreen = (azDeg, rM) => {
-  const a = (azDeg - 90) * Math.PI / 180;
-  const rr = (rM / S.range) * R;
-  return [CX + Math.cos(a) * rr, CY + Math.sin(a) * rr];
-};
-```
-
-**转速滑块**（`app.js`）：
-
-```js
-rpm.onchange = async () => {
-  const v = Number(rpm.value);
-  const res = await control('motor', v);        // POST /api/control
-  $('rpm-sub').textContent = res.ok
-    ? `已下发 ${v} rpm${res.dry ? '（dry-run）' : ''}`
-    : '下发失败：' + (res.error || '未知错误');
-};
-// 每 3 秒轮询 /api/state，外部改了速度时同步显示（拖滑块时不覆盖）
-setInterval(async () => {
-  if (document.activeElement === $('rpm')) return;
-  const st = await (await fetch('/api/state')).json();
-  ...
-}, 3000);
-```
+点云按地面、线缆、障碍分图层，量程可固定或自动选择。1E62 的有效扇区、最近距离和高度置信度单独显示。电机转速卡片显示最近一次成功下发的设定值，电机指令由表单提交触发。
 
 ### 7.3 辅助脚本（`tools/`）
 
@@ -523,7 +463,7 @@ setInterval(async () => {
 |---|---|---|
 | `tools/motor_bridge.py` | 64 | **VM 内以 root 常驻**：UDP 50009 → `duml_can_tool` → CAN |
 | `tools/forward_40204.py` | 31 | **VM 内常驻**：40204 转发到 Windows（192.168.59.1） |
-| `tools/radar_udp_sender.py` | 263 | 单文件 UDP 上行发送器（手机 Termux 可跑，没雷达时验证链路） |
+| `tools/radar_avoidance_relay.py` | — | VM 侧 1E62 转发，保持 flight_mode=2 |
 | `tools/draw_wiring.py` | 231 | 画接线图 |
 | `tools/fetch_termux_pkgs.py` | 202 | Termux 包抓取 |
 
@@ -581,7 +521,7 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
   │              SSE /events ──▶ 浏览器（frontend/app.js）
   │
   ├── UDP 9876/9877（顶阵/侧面原始，radar_streamer）──▶ radar_viewer.py（可选）
-  ├── UDP 50007（V1 控制面）◀── radar_min_client.py（假飞控）
+  ├── UDP 50007（V1 控制与 1E62）◀──▶ radar_avoidance_relay.py → Windows UDP 40204
   └── CAN 0x0A2/0x0A3 ◀──▶ duml_can_tool / motor_bridge
 ```
 
@@ -590,46 +530,21 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/` | 页面 |
-| GET | `/events` | **SSE 实时帧**（前端唯一数据源） |
-| GET | `/api/state` | 状态：`running/frames/crc_ok/source/rpm/motor_speed/height_cm`，UDP 模式另有 `data_status` |
-| GET | `/api/protocol` | 示例协议字段与 hex |
-| GET | `/api/snapshot` | ⚠️ **sim 合成数据**（离线快照用，不是真机） |
-| POST | `/api/control` | `{action, value, dry}` |
-
-`POST /api/control` 支持的 action：
-
-| action | value | 行为 |
-|---|---|---|
-| `start` / `stop` / `toggle` | — | 启停（sim 模式） |
-| `rpm` | 0–1800 | 改 sim 转速（不碰真机） |
-| `motor` | 0–1800 | **真机转速**：→ UDP 桥 → CAN → ESC |
-| `scene` | room/field/wire/obstacle | 切 sim 场景 |
-| `height` | 0–300 | 雷达离地高度（cm） |
+| GET | `/events` | 实收帧与链路状态的 SSE 推送 |
+| GET | `/api/state` | 包计数、接收状态、最近 1E62 结果和电机设定值 |
+| GET | `/api/protocol` | 最近有效的 1E61 / 1E62 元数据和前 40 字节 |
+| POST | `/api/control` | `{"action":"motor","value":转速}`，由 VM 桥通过 CAN 下发 |
 
 ### 8.3 SSE 帧结构
 
-```json
-{
-  "type": "frame",
-  "t": 123.456,
-  "source": "udp",
-  "data_status": "live",
-  "data_epoch": 0,
-  "angle": null,
-  "rpm": null,
-  "running": null,
-  "height_cm": null,
-  "gated": null,
-  "points": [[291.28, 4.56, -0.507, 0.0, 0], ...],
-  "tracks": [...],
-  "sectors": [...],
-  "proto": {"msg": "0x1E61", "seq": 29902, "len": 130, "count": 2, "crc_ok": true, "hex": "..."}
-}
-```
+| `type` | 内容 |
+|---|---|
+| `frame` | `points`、`tracks`、`proto`、`stats` |
+| `avoidance` | `avoidance` 中的距离、扇区和高度置信度 |
+| `tracks` | 点云暂停期间更新预测航迹的状态和位置 |
+| `radar_status` | 两种数据的状态分别为 `waiting`、`live` 或 `stale` |
 
-`points` 每项为 `[方位角°, 水平距离m, 相对雷达高度m, 置信度0-1, subtype]`，subtype `0=ground / 1=wire / 2=pcla`。
-
-UDP 模式的 `data_status` 为 `waiting`（尚无有效 1E61）、`live`（有新鲜的有效帧）或 `stale`（2 秒未收到有效帧）。空点云帧通过校验后仍可维持 `live`。`stale` 清空 `points`、`tracks` 和 `proto`。SSE 的传输连接与数据状态独立，客户端只保留最新一条待发帧。每次过期令 `data_epoch` 加一，前端可借此清除上一段数据，即使中间的 `stale` 帧被较新的帧替换。
+`points` 每项依次为方位角（度）、距离（米）、高度（米）、归一化回波指标、类别。类别 `0` 是地面、`1` 是线缆、`2` 是障碍。
 
 ---
 
@@ -660,8 +575,6 @@ UDP 模式的 `data_status` 为 `waiting`（尚无有效 1E61）、`live`（有�
 头 +65..66 subtype：0=ground / 1=wire / 2=pcla
 记录 <H f f f H> = id(u16), x(f32), y(f32), z(f32), metric(u16)
 ```
-
-V2 声明总长度必须与 UDP 报文长度一致。接收 1E61 时要求双 CRC 校验通过，payload 长度必须等于 `69 + 16 × N`。模拟几何使用米，线上编码用分米，解码为米后进入跟踪和显示。
 
 **0x1E62 避障结果**（116 B）：16 个扇区项（方位/仰角/距离）+ 卡尔曼高度 + 融合高度 + 置信度。
 
@@ -776,7 +689,7 @@ dd if=/proc/1076/mem bs=1 skip=204273700 count=8 2>/dev/null | busybox od -x
 
 | 限制 | 说明 |
 |---|---|
-| 转速必须 900 | 低转速下侧面完全没数据，无法做低速演示 |
+| 低速障碍回波有限 | 200 rpm 台架采样可收到少量地面和线缆点，1E62 未产生有效扇区 |
 | 每帧只覆盖一个扇区 | 1E61 每帧 84–98 点集中在 22.5° 扇区，360° 需累积多帧 |
 | 侧面 pcla 点少 | 需要真实障碍物进入波束 + 距离 ≥ 2 m |
 | 顶阵未接入前端 | 数据链路现成（9876），只差解析 + 渲染 |
@@ -788,7 +701,7 @@ dd if=/proc/1076/mem bs=1 skip=204273700 count=8 2>/dev/null | busybox od -x
 1. **顶阵热图接入 Web**：`radar_streamer top` → UDP 9876 → 转发 → 后端加 OMNI 解析 → 前端加 32×64 热图面板
 2. **原始 CFAR 点云**：`radar_streamer side`（60632 B 帧）比 1E61 密得多
 3. **记录与回放**：SSE 落盘，支持离线分析
-4. **内核升级自动重编**：为已验证的驱动建立 DKMS 包，减少新内核上线时的手动步骤。开机自启目前见 §6.2。
+4. **开机自启**：把 §6.2 做成一键脚本 + systemd
 5. **移动端适配**：前端已有 `--host 0.0.0.0`，手机可看
 
 ### 11.3 复用与出处

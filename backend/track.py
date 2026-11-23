@@ -1,110 +1,226 @@
-"""点云目标跟踪：聚类 → 关联 → α-β 滤波 → 航迹管理。
-
-纯标准库实现（不依赖 numpy）。
-
-数据流：
-
-    points[]  (az, r, z, snr, subtype)
-        ↓ 极坐标转笛卡尔
-    XY DBSCAN（网格查找邻居，只有核心点扩张）
-        ↓
-    clusters  (质心 / 点数 / 平均强度)
-        ↓ 贪心最近邻关联（门限 GATE）
-    tracks    (id / 位置 / 速度 / 存活计数)
-        ↓
-    confirmed tracks → 前端画框 + 航迹列表
-
-为什么不用完整卡尔曼：目标运动近似匀速、观测噪声主要来自栅格量化
-（0.5 m 距离栅格、1° 方位），α-β 滤波在这种量级下与 KF 差别可忽略，
-但代码量和调试成本低一个数量级。
-"""
+"""跟踪 1E61 PCLA 障碍点，向前端输出已确认的实测或预测航迹。"""
 from __future__ import annotations
 
 import math
+from collections import deque
+from dataclasses import dataclass
+from itertools import product
 
-# ---- 调参区（都在米/秒量级，改这里就能调行为）----
-DBSCAN_EPS = 0.50    # DBSCAN 邻域半径 (m)：小于它的点视为同一物体
-MIN_PTS = 5          # 少于这个点数的簇当噪声丢掉
-MAX_PTS = 400        # 多于这个点数的簇当背景（墙/地面）
-GATE = 2.5           # 关联门限 (m)：预测位置与观测质心的最大距离
-ALPHA = 0.55         # 位置平滑增益（0~1，越大越信观测）
-BETA = 0.22          # 速度增益
-CONFIRM_HITS = 3     # 连续命中几次才算「确认航迹」
-MAX_MISSES = 4       # 连续几帧没关联上就销号
-MAX_TRACKS = 24      # 最多同时维护的航迹数（按距离保留最近的）
+TRACK_WINDOW = 0.35       # 新旧点共同建立簇的最长时间跨度，秒
+CLUSTER_RADIUS_M = 0.50   # 三维邻域半径
+MIN_PTS = 5               # 核心点邻居数，含自身
+MAX_PTS = 400             # 过大的连续回波簇通常是背景
+MATCH_RADIUS_M = 2.5
+INIT_RANGE_M = 12.0
+MAX_TRACKS = 24
+CONFIRM_HITS = 3          # 同一航迹需要三次独立的新观测
+OBSERVATION_S = 0.60     # 未收到下一帧时，暂时保留最近一次实测
+TENTATIVE_S = 0.75
+COAST_S = 1.25
+SEQUENCE_RESET_S = 5.0
+ALPHA = 0.55
+BETA = 0.22
+
+Position = tuple[float, float, float]
+Point = tuple[float, float, float, float]  # body x/y/z in metres, normalized intensity
+Cell = tuple[int, int, int]
+NEIGHBOR_CELLS = tuple(product((-1, 0, 1), repeat=3))
 
 
+@dataclass(frozen=True)
+class Detection:
+    position: Position
+    strength: float
 
 
+def cluster_detections(history: list[Point], fresh: list[Point]) -> list[Detection]:
+    """用三维 DBSCAN 聚类，只用簇中的新回波计算匹配所用的质心。"""
+    if not fresh:
+        return []
+
+    points = history + fresh
+    fresh_start = len(history)
+    locations = [p[:3] for p in points]
+    cells = [tuple(math.floor(v / CLUSTER_RADIUS_M) for v in pos) for pos in locations]
+    grid: dict[Cell, list[int]] = {}
+    for i, cell in enumerate(cells):
+        grid.setdefault(cell, []).append(i)
+
+    # 已归入一个簇的点不再参与扩张扫描，仍参与核心点的邻居计数。
+    remaining = {cell: set(indices) for cell, indices in grid.items()}
+    grid_neighbors = {
+        cell: [neighbor for dx, dy, dz in NEIGHBOR_CELLS
+               if (neighbor := (cell[0] + dx, cell[1] + dy, cell[2] + dz)) in grid]
+        for cell in grid
+    }
+
+    def is_core(i: int) -> bool:
+        count = 0
+        for cell in grid_neighbors[cells[i]]:
+            for j in grid[cell]:
+                if math.dist(locations[i], locations[j]) <= CLUSTER_RADIUS_M:
+                    count += 1
+                    if count == MIN_PTS:
+                        return True
+        return False
+
+    detections = []
+    for seed, seed_cell in enumerate(cells):
+        if seed not in remaining[seed_cell] or not is_core(seed):
+            continue
+        remaining[seed_cell].remove(seed)
+        stack = [seed]
+        members = [seed]
+        while stack:
+            core = stack.pop()
+            for cell in grid_neighbors[cells[core]]:
+                pool = remaining[cell]
+                neighbors = [j for j in pool
+                             if math.dist(locations[core], locations[j]) <= CLUSTER_RADIUS_M]
+                pool.difference_update(neighbors)
+                members.extend(neighbors)
+                stack.extend(j for j in neighbors if is_core(j))
+
+        measured = [points[i] for i in members if i >= fresh_start]
+        if not measured or len(members) > MAX_PTS:
+            continue
+        xs, ys, zs, strengths = zip(*measured)
+        n = len(measured)
+        detections.append(Detection((sum(xs) / n, sum(ys) / n, sum(zs) / n),
+                                    sum(strengths) / n))
+    return detections
+
+
+def _minimum_assignment(cost: list[list[float]]) -> list[int]:
+    """矩形代价矩阵的匈牙利算法。每行分配一列，列数至少等于行数。"""
+    rows, cols = len(cost), len(cost[0])
+    row_offset = [0.0] * (rows + 1)
+    col_offset = [0.0] * (cols + 1)
+    owner = [0] * (cols + 1)
+    predecessor = [0] * (cols + 1)
+    for row in range(1, rows + 1):
+        owner[0] = row
+        col = 0
+        visited = [False] * (cols + 1)
+        best = [math.inf] * (cols + 1)
+        while True:
+            visited[col] = True
+            current_row = owner[col]
+            delta = math.inf
+            next_col = 0
+            for j in range(1, cols + 1):
+                if visited[j]:
+                    continue
+                adjusted = cost[current_row - 1][j - 1] - row_offset[current_row] - col_offset[j]
+                if adjusted < best[j]:
+                    best[j], predecessor[j] = adjusted, col
+                if best[j] < delta:
+                    delta, next_col = best[j], j
+            for j in range(cols + 1):
+                if visited[j]:
+                    row_offset[owner[j]] += delta
+                    col_offset[j] -= delta
+                else:
+                    best[j] -= delta
+            col = next_col
+            if owner[col] == 0:
+                break
+        while col:
+            previous = predecessor[col]
+            owner[col] = owner[previous]
+            col = previous
+
+    columns = [-1] * rows
+    for col in range(1, cols + 1):
+        if owner[col]:
+            columns[owner[col] - 1] = col - 1
+    return columns
+
+
+def associate(predicted: list[Position], detections: list[Detection]) -> dict[int, int]:
+    """门限内优先保留最多的航迹，再比较匹配的总距离。"""
+    if not predicted or not detections:
+        return {}
+    distances = [[math.dist(position, det.position) for det in detections]
+                 for position in predicted]
+    eligible = [j for j in range(len(detections))
+                if any(row[j] <= MATCH_RADIUS_M for row in distances)]
+    if not eligible:
+        return {}
+    # 漏配代价超过全部合法距离的可能总和，故多匹配一条总会更优。
+    miss = (len(predicted) + 1) * MATCH_RADIUS_M
+    cost = [[row[j] if row[j] <= MATCH_RADIUS_M else 2 * miss for j in eligible]
+            + [miss] * len(predicted) for row in distances]
+    return {
+        i: eligible[col] for i, col in enumerate(_minimum_assignment(cost))
+        if 0 <= col < len(eligible) and distances[i][eligible[col]] <= MATCH_RADIUS_M
+    }
+
+
+@dataclass
 class Track:
-    __slots__ = ("id", "x", "y", "z", "vx", "vy", "vz",
-                 "hits", "misses", "age", "rng", "az", "el", "snr")
+    id: int
+    position: Position
+    strength: float
+    observed_at: float
+    velocity: Position = (0.0, 0.0, 0.0)
+    hits: int = 1
+    age: int = 1
+    confirmed: bool = False
+    missed: bool = False
 
-    def __init__(self, tid: int, x: float, y: float, z: float, snr: float):
-        self.id = tid
-        self.x, self.y, self.z = x, y, z
-        self.vx = self.vy = self.vz = 0.0
-        self.hits = 1
-        self.misses = 0
-        self.age = 1
-        self.rng = math.hypot(x, y)
-        self.az = math.degrees(math.atan2(y, x)) % 360.0
-        self.el = 0.0
-        self.snr = snr
+    def predict(self, timestamp: float) -> Position:
+        elapsed = max(0.0, timestamp - self.observed_at)
+        x, y, z = self.position
+        vx, vy, vz = self.velocity
+        return (x + vx * elapsed, y + vy * elapsed, z + vz * elapsed)
 
-    # --- 预测：匀速模型外推 ---
-    def predict(self, dt: float) -> tuple[float, float, float]:
-        return (self.x + self.vx * dt,
-                self.y + self.vy * dt,
-                self.z + self.vz * dt)
-
-    # --- 更新：α-β 滤波 ---
-    def update(self, mx: float, my: float, mz: float, snr: float, dt: float):
-        px, py, pz = self.predict(dt)
-        rx, ry, rz = mx - px, my - py, mz - pz      # 新息
-        self.x = px + ALPHA * rx
-        self.y = py + ALPHA * ry
-        self.z = pz + ALPHA * rz
-        if dt > 1e-6:
-            self.vx += BETA * rx / dt
-            self.vy += BETA * ry / dt
-            self.vz += BETA * rz / dt
-        self.rng = math.hypot(self.x, self.y)
-        self.az = math.degrees(math.atan2(self.y, self.x)) % 360.0
-        self.el = math.degrees(math.atan2(self.z, max(1e-6, self.rng)))
-        self.snr = snr
+    def update(self, detection: Detection, timestamp: float):
+        px, py, pz = self.predict(timestamp)
+        mx, my, mz = detection.position
+        rx, ry, rz = mx - px, my - py, mz - pz
+        vx, vy, vz = self.velocity
+        scale = BETA / max(0.02, timestamp - self.observed_at)
+        self.position = (px + ALPHA * rx, py + ALPHA * ry, pz + ALPHA * rz)
+        self.velocity = (vx + scale * rx, vy + scale * ry, vz + scale * rz)
+        self.strength = detection.strength
+        self.observed_at = timestamp
         self.hits += 1
-        self.misses = 0
         self.age += 1
+        self.confirmed |= self.hits >= CONFIRM_HITS
+        self.missed = False
 
     def miss(self):
-        self.misses += 1
         self.age += 1
-        self.hits = max(0, self.hits - 1)   # 漏检会削弱置信度
+        self.missed = True
+        if not self.confirmed:
+            self.hits = 0
 
-    @property
-    def confirmed(self) -> bool:
-        return self.hits >= CONFIRM_HITS and self.misses == 0
+    def expired(self, timestamp: float) -> bool:
+        lifetime = COAST_S if self.confirmed else TENTATIVE_S
+        return timestamp - self.observed_at >= lifetime
 
-    @property
-    def speed(self) -> float:
-        return math.hypot(self.vx, self.vy)
-
-    def to_dict(self) -> dict:
+    def to_dict(self, timestamp: float) -> dict:
+        elapsed = max(0.0, timestamp - self.observed_at)
+        coasting = self.missed or elapsed >= OBSERVATION_S
+        x, y, z = self.predict(timestamp) if coasting else self.position
+        vx, vy, _ = self.velocity
+        distance = math.hypot(x, y)
         return {
             "id": self.id,
-            "x": round(self.x, 3), "y": round(self.y, 3), "z": round(self.z, 3),
-            "vx": round(self.vx, 3), "vy": round(self.vy, 3),
-            "range": round(self.rng, 2),
-            "az": round(self.az, 1),
-            "el": round(self.el, 1),
-            "speed": round(self.speed, 2),
-            # 接近为正：径向速度分量
-            "radial": round(-(self.vx * self.x + self.vy * self.y) / max(1e-6, self.rng), 2),
-            "snr": round(self.snr, 3),
+            "x": round(x, 3), "y": round(y, 3), "z": round(z, 3),
+            "vx": round(vx, 3), "vy": round(vy, 3),
+            "range": round(distance, 2),
+            "az": round(math.degrees(math.atan2(y, x)) % 360.0, 1) % 360.0,
+            "el": round(math.degrees(math.atan2(z, distance)), 1),
+            "speed": round(math.hypot(vx, vy), 2),
+            "radial": round(-(vx * x + vy * y) / max(1e-6, distance), 2),
+            "snr": round(self.strength, 3),
             "hits": self.hits,
             "age": self.age,
             "confirmed": self.confirmed,
+            "status": "coasting" if coasting else "observed",
+            "observation_age_s": round(elapsed, 3),
         }
 
 
@@ -112,130 +228,49 @@ class Tracker:
     def __init__(self):
         self.tracks: list[Track] = []
         self._next_id = 1
-        self.frames = 0
+        self._last_observation: tuple[float, int] | None = None
+        self._window: deque[tuple[float, list[Point]]] = deque()
 
-    # ---------------- 聚类 ----------------
-    @staticmethod
-    def _cluster(points: list, *, fresh_start: int = 0) -> list[dict]:
-        """Cluster in XY and emit only clusters containing a current return."""
-        xs, ys, zs, weights, cells = [], [], [], [], []
-        grid = {}
-        for i, (az, distance, z, snr, _) in enumerate(points):
-            angle = math.radians(az)
-            x = distance * math.cos(angle)
-            y = distance * math.sin(angle)
-            xs.append(x)
-            ys.append(y)
-            zs.append(z)
-            weights.append(snr)
-            cell = (math.floor(x / DBSCAN_EPS), math.floor(y / DBSCAN_EPS))
-            cells.append(cell)
-            grid.setdefault(cell, []).append(i)
+    def observe(self, points: list[Point], timestamp: float, seq: int) -> list[dict]:
+        """推进一次 PCLA 观测。同序号和乱序数据不更新航迹。"""
+        previous = self._last_observation
+        if previous is not None:
+            last_at, last_seq = previous
+            if timestamp - last_at < SEQUENCE_RESET_S:
+                seq_delta = (seq - last_seq) & 0xFFFFFFFF
+                if not 0 < seq_delta < 0x80000000:
+                    return self.snapshot(timestamp)
+            else:
+                self._window.clear()
+        self._last_observation = (timestamp, seq)
+        while self._window and timestamp - self._window[0][0] > TRACK_WINDOW:
+            self._window.popleft()
+        history = [point for _, batch in self._window for point in batch] if points else []
+        detections = cluster_detections(history, points)
+        if points:
+            self._window.append((timestamp, points))
 
-        remaining = {cell: set(indices) for cell, indices in grid.items()}
-        eps2 = DBSCAN_EPS ** 2
+        self.tracks = [track for track in self.tracks if not track.expired(timestamp)]
+        matched = associate([track.predict(timestamp) for track in self.tracks], detections)
+        for i, track in enumerate(self.tracks):
+            if i in matched:
+                track.update(detections[matched[i]], timestamp)
+            else:
+                track.miss()
 
-        def neighbours(i, buckets):
-            gx, gy = cells[i]
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    for j in buckets.get((gx + dx, gy + dy), ()):
-                        dx_m = xs[i] - xs[j]
-                        dy_m = ys[i] - ys[j]
-                        if dx_m * dx_m + dy_m * dy_m <= eps2:
-                            yield j
-
-        def is_core(i):
-            for count, _ in enumerate(neighbours(i, grid), 1):
-                if count == MIN_PTS:
-                    return True
-            return False
-
-        out = []
-        for i, cell in enumerate(cells):
-            if i not in remaining[cell] or not is_core(i):
-                continue
-            remaining[cell].remove(i)
-            members = [i]
-            pending = [i]
-            while pending:
-                # Only core points expand the cluster. Border points join once.
-                for j in list(neighbours(pending.pop(), remaining)):
-                    remaining[cells[j]].remove(j)
-                    members.append(j)
-                    if is_core(j):
-                        pending.append(j)
-
-            n = len(members)
-            if n > MAX_PTS or max(members) < fresh_start:
-                continue
-            out.append({
-                "x": sum(xs[j] for j in members) / n,
-                "y": sum(ys[j] for j in members) / n,
-                "z": sum(zs[j] for j in members) / n,
-                "snr": sum(weights[j] for j in members) / n,
-                "n": n,
-            })
-        return out
-
-    # ---------------- 主更新 ----------------
-    def update(self, points: list, dt: float, *, fresh_start: int = 0) -> list[dict]:
-        self.frames += 1
-        dt = max(1e-3, min(1.0, dt))
-        clusters = self._cluster(points, fresh_start=fresh_start)
-
-        # 预测全部航迹
-        preds = {t.id: t.predict(dt) for t in self.tracks}
-
-        # 贪心关联：先算所有 (距离, track, cluster)，从小到大匹配
-        pairs = []
-        for t in self.tracks:
-            px, py, pz = preds[t.id]
-            for ci, c in enumerate(clusters):
-                d = math.hypot(px - c["x"], py - c["y"])
-                if d <= GATE:
-                    pairs.append((d, t.id, ci))
-        pairs.sort(key=lambda p: p[0])
-
-        used_t: set[int] = set()
-        used_c: set[int] = set()
-        tmap = {t.id: t for t in self.tracks}
-        for _d, tid, ci in pairs:
-            if tid in used_t or ci in used_c:
-                continue
-            used_t.add(tid)
-            used_c.add(ci)
-            c = clusters[ci]
-            tmap[tid].update(c["x"], c["y"], c["z"], c["snr"], dt)
-
-        # 未匹配的航迹：miss
-        for t in self.tracks:
-            if t.id not in used_t:
-                t.miss()
-
-        # Start tracks only from unmatched clusters within 12 m.
-        for ci, c in enumerate(clusters):
-            if ci in used_c:
-                continue
-            if math.hypot(c["x"], c["y"]) > 12.0:
-                continue
-            if len(self.tracks) >= MAX_TRACKS:
+        used = set(matched.values())
+        candidates = sorted(
+            (det for i, det in enumerate(detections) if i not in used),
+            key=lambda det: math.hypot(*det.position[:2]),
+        )
+        for detection in candidates:
+            if len(self.tracks) >= MAX_TRACKS or math.hypot(*detection.position[:2]) > INIT_RANGE_M:
                 break
-            t = Track(self._next_id, c["x"], c["y"], c["z"], c["snr"])
-            self._next_id = self._next_id % 100000 + 1
-            self.tracks.append(t)
+            self.tracks.append(Track(self._next_id, detection.position, detection.strength, timestamp))
+            self._next_id += 1
+        return self.snapshot(timestamp)
 
-        # 销号
-        self.tracks = [t for t in self.tracks if t.misses <= MAX_MISSES]
-
-        # 排序：确认的在前，然后按距离
-        self.tracks.sort(key=lambda t: (not t.confirmed, t.rng))
-        return [t.to_dict() for t in self.tracks if t.confirmed]
-
-    # ---------------- 只读访问 ----------------
-    def snapshot(self) -> list[dict]:
-        return [t.to_dict() for t in self.tracks if t.confirmed]
-
-    @property
-    def count(self) -> int:
-        return sum(1 for t in self.tracks if t.confirmed)
+    def snapshot(self, timestamp: float) -> list[dict]:
+        tracks = [track.to_dict(timestamp) for track in self.tracks
+                  if track.confirmed and not track.expired(timestamp)]
+        return sorted(tracks, key=lambda track: track["range"])

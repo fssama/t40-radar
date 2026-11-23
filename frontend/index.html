@@ -1,135 +1,111 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>RD2484R 雷达监视</title>
-<link rel="stylesheet" href="style.css?v=9">
-<script>
-// 调试钩子：把首个运行时错误暴露到 DOM，便于定位
-window.addEventListener('error', function (e) {
-  var d = document.getElementById('jserr');
-  if (!d) { d = document.createElement('div'); d.id = 'jserr';
-    d.style.cssText = 'position:fixed;left:0;bottom:0;z-index:9999;background:#b00;color:#fff;font:12px monospace;padding:2px 6px';
-    document.body.appendChild(d); }
-  d.textContent = 'JSERR ' + e.message + ' @' + (e.filename || '') + ':' + e.lineno;
-});
-</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0a111c">
+<title>RD2484R 实机雷达</title>
+<link rel="stylesheet" href="/style.css?v=12">
+<script defer src="/app.js?v=12"></script>
 </head>
 <body>
 <div class="app">
-
   <header class="topbar">
     <div class="brand">
-      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
-        <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".35"/>
-        <circle cx="16" cy="16" r="8" fill="none" stroke="currentColor" stroke-width="1.3" opacity=".6"/>
-        <circle cx="16" cy="16" r="2.4" fill="currentColor"/>
-        <path d="M16 16 L27 9.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-      </svg>
-      <div class="brand-text">
-        <h1>RD2484R 雷达监视</h1>
-        <p>DJI Agras T40 · 24 GHz 有源相控阵</p>
+      <span class="radar-icon" aria-hidden="true"></span>
+      <div>
+        <p class="device">DJI AGRAS T40</p>
+        <h1>RD2484R 实机雷达</h1>
       </div>
     </div>
-
     <div class="badges">
-      <span class="badge" id="badge-conn"><i></i>连接中</span>
-      <span class="badge" id="badge-run"><i></i>已停止</span>
-      <span class="badge" id="badge-crc"><i></i>CRC —</span>
-      <span class="badge ghost" id="badge-src">SIM</span>
-      <span class="clock" id="clock">--:--:--</span>
+      <span class="badge" id="badge-conn" role="status">连接网页</span>
+      <span class="badge" id="badge-run" role="status">等待雷达</span>
+      <time id="clock" class="clock"></time>
     </div>
   </header>
 
-  <main class="grid">
-
-    <section class="panel ppi-panel">
-      <div class="panel-head">
-        <h2>全向态势 <span class="hint">侧阵 12×6 · 机械扫描</span></h2>
-        <div class="ranges" id="ranges"></div>
-      </div>
+  <main class="dashboard">
+    <section class="panel ppi-panel" aria-labelledby="ppi-title">
+      <header class="panel-head ppi-head">
+        <div>
+          <div class="heading"><h2 id="ppi-title">全向点云</h2><span class="code-label">1E61</span></div>
+          <p class="sub">以雷达为原点 · 0° 为正前方</p>
+        </div>
+        <div class="ranges" id="ranges" role="group" aria-label="点云量程"></div>
+      </header>
       <div class="ppi-wrap">
-        <canvas id="ppi"></canvas>
-        <div class="ppi-hint" id="ppi-hint">等待数据…</div>
+        <canvas id="ppi" aria-label="雷达点云极坐标图"></canvas>
+        <div class="ppi-hint" id="ppi-hint">
+          <strong id="ppi-message">等待 1E61 点云</strong>
+          <span id="ppi-detail">UDP 接收有效帧后会自动绘制</span>
+        </div>
       </div>
-      <div class="ppi-foot">
-        <span class="legend">
-          <i class="lg-ground"></i>地面
-          <i class="lg-wire"></i>线缆
-          <i class="lg-pcla"></i>障碍
-        </span>
-        <span id="ppi-stat">—</span>
-        <span id="range-foot">0 – 20 m</span>
-      </div>
+      <footer class="ppi-foot">
+        <div class="legend" id="legend" role="group" aria-label="点云图层"></div>
+        <div class="plot-meta"><span id="stat-fps">—</span><span id="range-foot">量程 10 m</span></div>
+      </footer>
     </section>
 
-    <aside class="side">
-      <div class="card">
-        <label>最近障碍物</label>
-        <div class="big"><span id="near-dist">—</span><em>m</em></div>
-        <div class="sub" id="near-az">等待数据…</div>
-      </div>
+    <aside class="side" aria-label="雷达读数">
+      <section class="panel instrument" id="avoidance-card" aria-labelledby="near-title">
+        <div class="heading spread"><h2 id="near-title">最近障碍物</h2><span class="code-label">1E62</span></div>
+        <div class="reading"><span id="near-dist">—</span><span>m</span></div>
+        <p class="sub avoid-message" id="near-az" role="status">等待 1E62 避障结果</p>
+        <div class="sector-head"><span>有效扇区</span><strong id="sector-count">— / 16</strong></div>
+        <div id="sector-strip" class="sector-strip" aria-hidden="true"></div>
+      </section>
 
-      <div class="card">
-        <label>跟踪目标 <span class="pill" id="trk-count">0</span></label>
-        <ul id="trk-list"><li class="empty">无确认航迹</li></ul>
-      </div>
+      <section class="panel instrument telemetry" aria-label="高度与转速">
+        <div>
+          <h2>融合高度</h2>
+          <div class="metric"><span id="h-val">—</span> <span>cm</span></div>
+          <p class="sub" id="h-sub">等待 1E62</p>
+        </div>
+        <div>
+          <h2>转速设定值</h2>
+          <div class="metric"><span id="rpm-val">—</span> <span>rpm</span></div>
+          <p class="sub">最近一次成功下发</p>
+        </div>
+      </section>
 
-      <div class="card">
-        <label>电机转速 <span class="tag">CAN 下发</span></label>
-        <div class="big"><span id="rpm-val">—</span><em>rpm</em></div>
-        <div class="sub" id="rpm-sub">雷达未通过 V2 上报转速</div>
-      </div>
+      <section class="panel instrument links" aria-labelledby="links-title">
+        <div class="heading spread"><h2 id="links-title">数据链路</h2><span class="code-label">UDP</span></div>
+        <div class="feed-row">
+          <span><b class="mono">1E61</b> 点云</span><span id="feed-1e61" class="feed-state">等待</span>
+        </div>
+        <div class="feed-row">
+          <span><b class="mono">1E62</b> 避障</span><span id="feed-1e62" class="feed-state">等待</span>
+        </div>
+        <details id="protocol-details">
+          <summary>原始帧前 40 字节</summary>
+          <div class="protocol-packets">
+            <div><span id="proto-kv">1E61 · 等待数据</span><code id="proto-hex"></code></div>
+            <div><span id="avoid-proto-kv">1E62 · 等待数据</span><code id="avoid-proto-hex"></code></div>
+          </div>
+        </details>
+      </section>
 
-      <div class="card">
-        <label>雷达高度</label>
-        <div class="big"><span id="h-val">—</span><em>cm</em></div>
-        <div class="sub" id="h-sub">本地设定 · 用于俯仰剖面</div>
-      </div>
-
-      <div class="card mini">
-        <label>俯仰剖面</label>
-        <canvas id="elev"></canvas>
-      </div>
-
-      <div class="card proto">
-        <label>1E61 协议帧</label>
-        <div class="kv" id="proto-kv">—</div>
-        <code id="proto-hex"></code>
-      </div>
+      <section class="panel instrument" aria-labelledby="tracks-title">
+        <div class="heading spread"><h2 id="tracks-title">跟踪目标</h2><span class="code-label" id="trk-count">—</span></div>
+        <ul id="trk-list"><li class="empty">等待点云</li></ul>
+      </section>
+      <section class="panel instrument" aria-labelledby="profile-title">
+        <div class="heading spread"><h2 id="profile-title">高度剖面</h2><span class="sub">雷达为零点</span></div>
+        <canvas id="profile" aria-label="点云距离与相对高度图"></canvas>
+      </section>
+      <details class="panel motor-panel">
+        <summary>电机控制 <span>CAN</span></summary>
+        <form id="motor-form">
+          <label for="rpm">目标转速</label>
+          <div class="motor-input"><input id="rpm" type="number" min="0" max="1800" step="1" inputmode="numeric" required aria-describedby="rpm-sub"><span>rpm</span></div>
+          <button id="motor-submit" type="submit">下发转速</button>
+          <output id="rpm-sub" role="status" for="rpm"></output>
+        </form>
+      </details>
     </aside>
-
   </main>
 
-  <footer class="controls">
-    <button class="btn primary" id="btn-run">启动</button>
-
-    <div class="ctl">
-      <label>转速 <b id="rpm-label">60</b> rpm</label>
-      <input type="range" id="rpm" min="0" max="1800" step="10" value="60">
-    </div>
-
-    <div class="ctl">
-      <label>场景</label>
-      <select id="scene">
-        <option value="room">室内房间</option>
-        <option value="field">开阔场地</option>
-        <option value="wire">线缆场景</option>
-        <option value="obstacle">走廊行人</option>
-      </select>
-    </div>
-
-    <div class="ctl">
-      <label>雷达高度 <b id="h-label">180</b> cm</label>
-      <input type="range" id="height" min="20" max="300" step="1" value="180">
-    </div>
-
-    <div class="spacer"></div>
-    <div class="stat" id="stat-fps">—</div>
-  </footer>
-
 </div>
-<script src="app.js?v=10"></script>
 </body>
 </html>
