@@ -260,8 +260,7 @@ A5 是 CC1 触点，只能过几百 mA。让 12–18 W 的电流从 CC 触点回
 - CAN 需要 SocketCAN + `slcand`
 - Windows 原生两个都不行
 
-本文档的环境：**VMware 里的 Ubuntu 25.10**（内核 `6.17.0-41-generic`，已 hold 住不升级）。
-主机 Windows 只跑前端，不直接碰硬件。
+历史实测使用 VMware 内的 Ubuntu 25.10 和 `6.17.0-41-generic`。当前部署入口见 [Agent 部署工作流](AGENT-DEPLOY.md)，按目标内核编译并验证驱动。Windows 可以作为监视器或浏览器宿主。
 
 ### 5.2 基础环境清单
 
@@ -309,21 +308,7 @@ struct wmi_connect_event {
    return 0;
    ```
 
-**加载新驱动**（每次开机或 USB 重插后都要）：
-
-```bash
-cd ~/work/dji-agras-radar/ar1021x_driver
-echo ubuntu | sudo -S -p '' make load
-```
-
-验证：
-
-```bash
-cat /sys/module/ath6kl_core/srcversion
-# 期望 F2F6840BB20AAEAE7361468（带补丁）
-# 若为 6D77789D37DFD186B50EF1E = 系统从 /lib/modules/.../updates 加载了旧的无补丁版本
-dmesg | grep -E 'ATH6KL_AUTHORIZE|ATH6KL_UNAUTHZ_SKIP'
-```
+**持久选择补丁版**见 [Agent 部署工作流](AGENT-DEPLOY.md#3-分层验收与故障处理)。驱动装入当前内核的 `updates/t40-radar/`，分别验证 `modinfo -n` 解析路径和两个已加载模块的 `srcversion`。前者是下次加载的候选，后者才代表当前正在运行的构建。旧环境曾记录补丁版 core 为 `F2F6840BB20AAEAE7361468`、旧版为 `6D77789D37DFD186B50EF1E`，这些历史值不可用于判定其他内核的构建。
 
 ### 5.4 起 AP 并等雷达连上
 
@@ -402,32 +387,10 @@ type=6 ver=0 flags=0x0005 btm=1.41m up=100.00m height=0.00m(kalman) conf=0 activ
 | 9 | VM | `python3 /tmp/fwd.py`（40204 转发） | 日志 `fwd #1 ... from 192.168.8.2:40204` |
 | 10 | Windows | `python run.py --port 8010 --source udp` | 页面出现点云 |
 
-### 6.2 一键脚本（建议）
+### 6.2 Agent 自动部署
 
-VM 侧 `~/start_all.sh`：
+新部署使用 [Agent 部署工作流](AGENT-DEPLOY.md)。它处理应用服务、当前内核的 AR1021x 驱动、USB 热插拔 AP 和可选 UDP 飞控服务。启用 UDP 飞控时，监视器使用 40204，客户端使用 40205。真机部署完成后，由分层检查记录 USB、AP、关联和有效 1E61 的各自状态。
 
-```bash
-#!/bin/bash
-cd ~/work/dji-agras-radar/ar1021x_driver
-echo ubuntu | sudo -S -p '' make load
-sudo ip link set wlx00037f2044d2 up
-sudo ip addr add 192.168.8.1/24 dev wlx00037f2044d2 2>/dev/null
-cd ~/work/dji-agras-radar/setup && sudo ./start_ap.sh
-sleep 50
-sudo slcand -o -c -s8 /dev/ttyACM0 can0
-sudo ip link set can0 up
-setsid nohup ~/work/venv/bin/python ~/work/dji-agras-radar/radar_client/radar_min_client.py \
-    --flight-mode 2 --v2-local-port 40205 > /tmp/rmc.log 2>&1 &
-setsid nohup python3 /tmp/fwd.py > /tmp/fwd.log 2>&1 &
-setsid nohup sudo /home/ubuntu/work/venv/bin/python /tmp/motor_bridge.py > /tmp/mb.log 2>&1 &
-```
-
-Windows 侧：
-
-```bat
-cd E:\dsh\t40-radar
-python run.py --port 8010 --source udp
-```
 
 ### 6.3 转速门槛（实测，务必知道）
 
@@ -628,8 +591,8 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
 |---|---|---|
 | GET | `/` | 页面 |
 | GET | `/events` | **SSE 实时帧**（前端唯一数据源） |
-| GET | `/api/state` | 状态：`running/frames/crc_ok/source/rpm/motor_speed/height_cm` |
-| GET | `/api/protocol` | 最近一帧协议字段 + hex |
+| GET | `/api/state` | 状态：`running/frames/crc_ok/source/rpm/motor_speed/height_cm`，UDP 模式另有 `data_status` |
+| GET | `/api/protocol` | 示例协议字段与 hex |
 | GET | `/api/snapshot` | ⚠️ **sim 合成数据**（离线快照用，不是真机） |
 | POST | `/api/control` | `{action, value, dry}` |
 
@@ -649,10 +612,14 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
 {
   "type": "frame",
   "t": 123.456,
-  "angle": 291.3,
+  "source": "udp",
+  "data_status": "live",
+  "data_epoch": 0,
+  "angle": null,
   "rpm": null,
-  "running": true,
-  "height_cm": 180,
+  "running": null,
+  "height_cm": null,
+  "gated": null,
   "points": [[291.28, 4.56, -0.507, 0.0, 0], ...],
   "tracks": [...],
   "sectors": [...],
@@ -660,7 +627,9 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
 }
 ```
 
-`points` 每项 = `[方位角°, 距离m, 高度m, 置信度0-1, subtype]`，subtype `0=ground / 1=wire / 2=pcla`。
+`points` 每项为 `[方位角°, 水平距离m, 相对雷达高度m, 置信度0-1, subtype]`，subtype `0=ground / 1=wire / 2=pcla`。
+
+UDP 模式的 `data_status` 为 `waiting`（尚无有效 1E61）、`live`（有新鲜的有效帧）或 `stale`（2 秒未收到有效帧）。空点云帧通过校验后仍可维持 `live`。`stale` 清空 `points`、`tracks` 和 `proto`。SSE 的传输连接与数据状态独立，客户端只保留最新一条待发帧。每次过期令 `data_epoch` 加一，前端可借此清除上一段数据，即使中间的 `stale` 帧被较新的帧替换。
 
 ---
 
@@ -691,6 +660,8 @@ DEST = ("192.168.59.1", 40204)    # Windows 宿主侧地址
 头 +65..66 subtype：0=ground / 1=wire / 2=pcla
 记录 <H f f f H> = id(u16), x(f32), y(f32), z(f32), metric(u16)
 ```
+
+V2 声明总长度必须与 UDP 报文长度一致。接收 1E61 时要求双 CRC 校验通过，payload 长度必须等于 `69 + 16 × N`。模拟几何使用米，线上编码用分米，解码为米后进入跟踪和显示。
 
 **0x1E62 避障结果**（116 B）：16 个扇区项（方位/仰角/距离）+ 卡尔曼高度 + 融合高度 + 置信度。
 
@@ -817,7 +788,7 @@ dd if=/proc/1076/mem bs=1 skip=204273700 count=8 2>/dev/null | busybox od -x
 1. **顶阵热图接入 Web**：`radar_streamer top` → UDP 9876 → 转发 → 后端加 OMNI 解析 → 前端加 32×64 热图面板
 2. **原始 CFAR 点云**：`radar_streamer side`（60632 B 帧）比 1E61 密得多
 3. **记录与回放**：SSE 落盘，支持离线分析
-4. **开机自启**：把 §6.2 做成一键脚本 + systemd
+4. **内核升级自动重编**：为已验证的驱动建立 DKMS 包，减少新内核上线时的手动步骤。开机自启目前见 §6.2。
 5. **移动端适配**：前端已有 `--host 0.0.0.0`，手机可看
 
 ### 11.3 复用与出处

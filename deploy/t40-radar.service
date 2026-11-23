@@ -1,0 +1,18 @@
+[Unit]
+Description=T40 radar monitor
+After=network.target
+
+[Service]
+Type=exec
+DynamicUser=yes
+WorkingDirectory=/opt/t40-radar
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=T40_MOTOR_BRIDGE=127.0.0.1:50009
+EnvironmentFile=/etc/t40-radar/monitor.env
+ExecStart=/usr/bin/python3 /opt/t40-radar/run.py --host 127.0.0.1 --port $T40_PORT --source $T40_SOURCE
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

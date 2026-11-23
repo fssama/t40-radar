@@ -29,7 +29,9 @@
     crcOk: null,
     src: '—',
     range: 10,
-    heightCm: 180,
+    heightCm: null,
+    udpStatus: null,
+    udpEpoch: null,
     scene: 'room',
     motor: { value: 60, status: 'idle', detail: '' },
     points: [],
@@ -46,7 +48,7 @@
   function setBadge(el, text, cls) {
     if (!el) return;
     el.className = 'badge ' + (cls || '');
-    el.innerHTML = '<i></i>' + text;
+    el.replaceChildren(document.createElement('i'), text);
   }
 
   /* ── PPI 画布 ───────────────────────────────────── */
@@ -233,6 +235,17 @@
   function onFrame(f) {
     if (!f || f.type === 'error') return;
 
+    if (f.source === 'udp') {
+      if (S.udpEpoch !== null && S.udpEpoch !== f.data_epoch) clearUdpHistory();
+      S.udpEpoch = f.data_epoch ?? null;
+      setUdpStatus(f.data_status);
+      if (f.data_status !== 'live') return;
+    } else {
+      S.running = f.running;
+      S.heightCm = f.height_cm ?? null;
+      $('h-val').textContent = S.heightCm ?? '—';
+      syncRunBtn();
+    }
     S.lastAngle = f.angle;
     if (f.rpm != null) S.motor.value = f.rpm;
 
@@ -260,10 +273,10 @@
     updateUI(f);
   }
 
-  function updateUI(f) {
+  function updateUI(f = {}) {
     // 统计
     const t = now();
-    S.marks.push([t, (f.points || []).length]);
+    if (f.type === 'frame') S.marks.push([t, (f.points || []).length]);
     while (S.marks.length && t - S.marks[0][0] > 1000) S.marks.shift();
     const fps = S.marks.length;
     let pps = 0;
@@ -285,10 +298,15 @@
     }
     if (best) {
       $('near-dist').textContent = best[1].toFixed(2);
-      $('near-az').textContent = `方位 ${best[0].toFixed(1)}° · 高 ${(S.heightCm / 100 - best[2]).toFixed(2)} m`;
+      const height = S.heightCm == null
+        ? `相对雷达 ${best[2].toFixed(2)} m`
+        : `离地 ${(S.heightCm / 100 + best[2]).toFixed(2)} m`;
+      $('near-az').textContent = `方位 ${best[0].toFixed(1)}° · ${height}`;
     } else {
       $('near-dist').textContent = '—';
-      $('near-az').textContent = '视场内无障碍';
+      $('near-az').textContent = S.udpStatus && S.udpStatus !== 'live'
+        ? '暂无雷达数据'
+        : '暂无障碍点';
     }
 
     // 航迹
@@ -299,21 +317,19 @@
       ul.innerHTML = '<li class="empty">无确认航迹</li>';
     } else {
       ul.innerHTML = tr.slice(0, 6).map((k) =>
-        `<li><span>#${k.id ?? '—'}</span><span>${(k.dist ?? k.r ?? 0).toFixed?.(2) ?? '—'} m</span><span>${(k.az ?? 0).toFixed?.(0) ?? '—'}°</span></li>`
+        `<li><span>#${k.id ?? '—'}</span><span>${(k.range ?? k.dist ?? k.r)?.toFixed(2) ?? '—'} m</span><span>${(k.az ?? 0).toFixed?.(0) ?? '—'}°</span></li>`
       ).join('');
     }
 
     // 协议帧
-    if (f.proto) {
-      const p = f.proto;
-      $('proto-kv').innerHTML =
-        `<b>${p.msg ?? '—'}</b> · seq ${p.seq ?? '—'} · ` +
-        `${p.len ?? 0} B · ${p.count ?? 0} 点 · CRC ${p.crc_ok ? 'OK' : '—'}`;
-      if (p.hex) $('proto-hex').textContent = p.hex;
-    }
+    const p = f.proto;
+    $('proto-kv').textContent = p
+      ? `${p.msg} · seq ${p.seq} · ${p.len} B · ${p.count} 点 · CRC ${p.crc_ok ? 'OK' : '—'}`
+      : '—';
+    $('proto-hex').textContent = p?.hex || '';
+    setBadge($('badge-crc'), p?.crc_ok ? 'CRC OK' : 'CRC —', p?.crc_ok ? 'on' : '');
 
-    // 统计条
-    $('ppi-hint').classList.add('hide');
+    $('ppi-hint').classList.toggle('hide', !S.udpStatus || S.udpStatus === 'live');
     drawElev();
   }
 
@@ -396,8 +412,43 @@
     };
   }
 
+  function setUdpStatus(status = 'waiting') {
+    if (S.udpStatus === status) return;
+    S.src = 'UDP';
+    S.udpStatus = status;
+    S.running = null;
+    S.heightCm = null;
+    $('badge-src').textContent = S.src;
+    $('btn-run').disabled = true;
+    $('height').disabled = true;
+    $('scene').disabled = true;
+    $('h-val').textContent = '—';
+    $('h-label').textContent = '—';
+    $('h-sub').textContent = '1E61 未提供雷达离地高度';
+    syncRunBtn();
+    if (status === 'live') return;
+
+    clearUdpHistory();
+    $('ppi-hint').textContent = status === 'stale' ? '雷达数据超时' : '等待雷达数据…';
+    updateUI();
+  }
+
+  function clearUdpHistory() {
+    S.points = [];
+    S.tracks = [];
+    S.marks = [];
+    S.proto = null;
+    S.lastAngle = null;
+  }
+
   function syncRunBtn() {
     const b = $('btn-run');
+    if (S.udpStatus) {
+      b.textContent = '真机接收';
+      const text = { waiting: '等待雷达数据', live: '雷达数据正常', stale: '雷达数据超时' };
+      setBadge($('badge-run'), text[S.udpStatus], S.udpStatus === 'live' ? 'on' : 'warn');
+      return;
+    }
     b.textContent = S.running ? '停止' : '启动';
     b.classList.toggle('stopping', S.running);
     setBadge($('badge-run'), S.running ? '运行中' : '已停止', S.running ? 'on' : '');
@@ -413,6 +464,7 @@
     es.onerror = () => {
       S.connected = false;
       setBadge($('badge-conn'), '重连中', 'warn');
+      if (S.src === 'UDP') setUdpStatus('waiting');
     };
     es.onmessage = (ev) => {
       try { onFrame(JSON.parse(ev.data)); } catch (_) { /* 忽略坏帧 */ }
@@ -430,6 +482,7 @@
       S.running = !!st.running;
       S.src = (st.source || '—').toUpperCase();
       $('badge-src').textContent = S.src;
+      if (st.source === 'udp') setUdpStatus(st.data_status);
       const lastSpeed = st.motor_speed != null ? st.motor_speed : st.rpm;
       if (lastSpeed != null) {
         S.motor.value = lastSpeed;

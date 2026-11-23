@@ -8,6 +8,8 @@
 > CAN/DUML、UDP V1/V2 帧格式与内存导出脚本）。本工程是独立实现，未复制其代码。
 >
 > 📘 **完整工作流（购物清单 / 接线教程 / 部署 / 协议 / 排错）见 [docs/WORKFLOW.md](docs/WORKFLOW.md)。**
+>
+> Ubuntu 自动部署、AR1021x 开机选驱动及 USB 热插拔验证见 [Agent 部署工作流](docs/AGENT-DEPLOY.md)。
 
 ---
 
@@ -98,7 +100,8 @@ Python 3.8+，不需要 `pip install` 任何东西。
 头  +3..4   记录数 N (u16)
 头  +65..66 subtype：0=ground / 1=wire / 2=pcla
 记录 <H f f f H> = id(u16), x(f32), y(f32), z(f32), metric(u16)
-                  body 坐标系：前 x / 右 y / 上 z，单位 m
+                  body 坐标系：前 x / 右 y / 上 z，线上单位 dm（0.1 m）
+                  模拟场景、SSE 和跟踪使用米，编码和解码各转换一次
                   metric = 置信度 × 65535
 ```
 
@@ -108,7 +111,8 @@ Python 3.8+，不需要 `pip install` 任何东西。
 表在 `backend/protocol/crc_tables.py`（从原作者的 ROM 表抽取），
 `tools/radar_udp_sender.py` 里用算法生成同一张表并做了逐字节校验。
 
-`GET /api/protocol` 会返回当前帧的 hex，方便和真机抓包对照。
+UDP 接收仅处理通过 CRC8、CRC16 和长度校验的 1E61。空点云可以是有效帧。
+`GET /api/protocol` 返回示例帧的 hex，方便和真机抓包对照。
 
 ---
 
@@ -132,26 +136,28 @@ docs/shot-sim.png            界面截图
 |---|---|---|
 | GET | `/` | 页面 |
 | GET | `/events` | SSE 帧流 |
-| GET | `/api/state` | 当前状态 JSON |
+| GET | `/api/state` | 当前状态 JSON。UDP 模式的 `data_status` 为 `waiting`、`live` 或 `stale` |
 | GET | `/api/protocol` | 最近一帧协议字段 + hex |
 | GET | `/api/snapshot?n=30` | 合成 N 帧（离线快照） |
 | POST | `/api/control` | `{action: start\|stop\|toggle\|rpm\|scene\|height, value}` |
 
 ---
 
+UDP 模式下，1E61 未提供实测转速、运行状态、扫描角、离地高度和高度门控，相关字段为 `null`。`motor_speed` 仍表示保存的下发值。连续 2 秒未收到有效 1E61 时清空当前点云和航迹，SSE 保持连接。每个 SSE 客户端只保留最新一条待发消息。
+
 ## 6. 模拟器物理约定
 
 - 地面恒在 `z = -h`（h 为雷达离地高度）。只有俯仰角 ≤ 10° 的地面进波束，
   所以近端从 `r_min = h / tan(10°)` 开始（h=1.8 m 时约 10 m）。
 - 每帧扫过 `sweep = clamp(rpm × 6 × dt × 0.35, 6°, 90°)` 的扇区；900 rpm @10 fps 约 60°。
-- 每帧约 50–64 条射线 + 60 个地面点，编码成 1E61 后做一次完整往返解析校验。
+- 内置模拟器运行时每帧发射 300 条射线并生成 60 个地面点。协议面板展示单一 subtype 的 1E61 编码并校验往返，独立 UDP 模拟器按 subtype 分包。
 - 高度 < 160 cm 且 running 时，前端会提示"低于 1.6 m 门限，避障被清零"（真机行为）。
 
 ---
 
 ## 7. 已知限制
 
-- 只实现了**接收**（1E61/1E62）。假飞控的 V1 控制面（50007）与 CAN DUML 不在本工程内，
+- 实时 UDP 点云接收消费 1E61。1E62 的编解码未接入这条实时链路。假飞控的 V1 控制面（50007）与 CAN DUML 不在本工程内，
   真机联调时仍需作者的 `radar_min_client.py` 或等价实现。
 - 不带录制/回放（可作为下一步：把 `/events` 落 JSONL 再回放）。
 - 顶面 4×4 阵的原始热图不在网络协议里，只能从雷达进程内存读，本工程未涉及。

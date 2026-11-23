@@ -22,8 +22,9 @@
 """
 from __future__ import annotations
 
+import math
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .crc import crc8, crc16
 
@@ -41,6 +42,9 @@ EP_BLACKBOX = (0x1D, 0x00)
 SUBTYPE_GROUND = 0
 SUBTYPE_WIRE = 1
 SUBTYPE_PCLA = 2
+
+PERCEPTION_HEADER_LEN = 69
+PERCEPTION_RECORD = struct.Struct("<HfffH")
 
 
 @dataclass
@@ -95,6 +99,7 @@ def build_v2(msg: int, payload: bytes, seq: int = 0,
 
 
 def parse_v2(buf: bytes) -> V2Frame:
+    """Parse framing and expose CRC16 status for callers that inspect raw frames."""
     if len(buf) < HEADER_LEN + TAIL_LEN:
         raise ValueError(f"V2 frame too short: {len(buf)}")
     if buf[0] != SOF:
@@ -143,29 +148,32 @@ class Record1E61:
     metric: int
 
     def pack(self) -> bytes:
-        return struct.pack("<HfffH", self.id & 0xFFFF, self.x, self.y, self.z,
-                           self.metric & 0xFFFF)
+        return PERCEPTION_RECORD.pack(self.id & 0xFFFF, self.x, self.y, self.z,
+                                      self.metric & 0xFFFF)
+
+    @classmethod
+    def from_metres(cls, rid: int, x: float, y: float, z: float, metric: int) -> Record1E61:
+        return cls(rid, x / UNIT_DM, y / UNIT_DM, z / UNIT_DM, metric)
 
     @property
     def az(self) -> float:
-        import math
         return math.degrees(math.atan2(self.y, self.x)) % 360.0
 
     @property
     def rng(self) -> float:
-        import math
-        return math.sqrt(self.x ** 2 + self.y ** 2) * UNIT_DM
+        return math.hypot(self.x, self.y) * UNIT_DM
 
 
 def build_1e61(records: list[Record1E61], subtype: int = SUBTYPE_PCLA,
                seq: int = 0, flags: int = 0x00) -> bytes:
     """打包 1E61 payload。头里 +3=记录数、+5=flags、+65=subtype。"""
-    hdr = bytearray(69)
+    if len(records) > 0xFFFF:
+        raise ValueError(f"1E61 too many records: {len(records)}")
+    hdr = bytearray(PERCEPTION_HEADER_LEN)
     hdr[0] = seq & 0xFF
     hdr[1] = (seq >> 8) & 0xFF
     hdr[2] = (seq >> 16) & 0xFF
-    hdr[3] = len(records) & 0xFF
-    hdr[4] = (len(records) >> 8) & 0xFF
+    struct.pack_into("<H", hdr, 3, len(records))
     hdr[5] = flags
     struct.pack_into("<H", hdr, 65, subtype & 0xFFFF)
     body = b"".join(r.pack() for r in records)
@@ -173,15 +181,19 @@ def build_1e61(records: list[Record1E61], subtype: int = SUBTYPE_PCLA,
 
 
 def parse_1e61(payload: bytes) -> dict:
-    if len(payload) < 69:
+    if len(payload) < PERCEPTION_HEADER_LEN:
         raise ValueError(f"1E61 payload too short: {len(payload)}")
-    n = payload[3] | (payload[4] << 8)
+    n = struct.unpack_from("<H", payload, 3)[0]
     subtype = struct.unpack_from("<H", payload, 65)[0]
-    body = payload[69:]
-    n = min(n, len(body) // 16)
+    expected = PERCEPTION_HEADER_LEN + n * PERCEPTION_RECORD.size
+    if len(payload) != expected:
+        raise ValueError(f"1E61 count/length mismatch: {n} records, expected {expected} B, got {len(payload)} B")
+
     recs = []
-    for i in range(n):
-        rid, x, y, z, metric = struct.unpack_from("<HfffH", body, i * 16)
+    body = memoryview(payload)[PERCEPTION_HEADER_LEN:]
+    for rid, x, y, z, metric in PERCEPTION_RECORD.iter_unpack(body):
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            raise ValueError("1E61 non-finite coordinate")
         recs.append(Record1E61(rid, x, y, z, metric))
     return {"subtype": subtype, "count": n, "records": recs}
 

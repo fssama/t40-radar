@@ -1,12 +1,12 @@
 """点云目标跟踪：聚类 → 关联 → α-β 滤波 → 航迹管理。
 
-纯标准库实现（不依赖 numpy），单帧 2000 点约 10–20 ms，10 Hz 余量充足。
+纯标准库实现（不依赖 numpy）。
 
 数据流：
 
     points[]  (az, r, z, snr, subtype)
         ↓ 极坐标转笛卡尔
-    grids     (1.2 m 网格 + 并查集合并相邻格)
+    XY DBSCAN（网格查找邻居，只有核心点扩张）
         ↓
     clusters  (质心 / 点数 / 平均强度)
         ↓ 贪心最近邻关联（门限 GATE）
@@ -34,25 +34,6 @@ MAX_MISSES = 4       # 连续几帧没关联上就销号
 MAX_TRACKS = 24      # 最多同时维护的航迹数（按距离保留最近的）
 
 
-class _UF:
-    """并查集：把相邻网格里的点合并成同一个簇。"""
-
-    __slots__ = ("p",)
-
-    def __init__(self, n: int):
-        self.p = list(range(n))
-
-    def find(self, a: int) -> int:
-        p = self.p
-        while p[a] != a:
-            p[a] = p[p[a]]      # 路径压缩
-            a = p[a]
-        return a
-
-    def union(self, a: int, b: int):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.p[rb] = ra
 
 
 class Track:
@@ -135,78 +116,73 @@ class Tracker:
 
     # ---------------- 聚类 ----------------
     @staticmethod
-    def _cluster(points: list) -> list[dict]:
-        """DBSCAN 聚类（网格加速），返回每个簇的质心与统计。
+    def _cluster(points: list, *, fresh_start: int = 0) -> list[dict]:
+        """Cluster in XY and emit only clusters containing a current return."""
+        xs, ys, zs, weights, cells = [], [], [], [], []
+        grid = {}
+        for i, (az, distance, z, snr, _) in enumerate(points):
+            angle = math.radians(az)
+            x = distance * math.cos(angle)
+            y = distance * math.sin(angle)
+            xs.append(x)
+            ys.append(y)
+            zs.append(z)
+            weights.append(snr)
+            cell = (math.floor(x / DBSCAN_EPS), math.floor(y / DBSCAN_EPS))
+            cells.append(cell)
+            grid.setdefault(cell, []).append(i)
 
-        为什么不用「网格 + 并查集」：那种做法会把所有相连的点连成一个簇，
-        场景里的墙、柱子、人只要沿扫描面连续分布就会被并成一大团，质心飘到
-        几何中心，跟踪器完全抓不住单个目标。DBSCAN 靠邻域半径 eps 划边界，
-        相距 0.75 m 以上的物体天然分开。
-        """
-        n = len(points)
-        if n == 0:
-            return []
+        remaining = {cell: set(indices) for cell, indices in grid.items()}
+        eps2 = DBSCAN_EPS ** 2
 
-        # 极坐标 → 笛卡尔（az 度、r 米、z 已是相对高度）
-        xs = [0.0] * n
-        ys = [0.0] * n
-        zs = [0.0] * n
-        ws = [0.0] * n
-        for i, (az, r, z, snr, _sub) in enumerate(points):
-            a = math.radians(az)
-            xs[i] = r * math.cos(a)
-            ys[i] = r * math.sin(a)
-            zs[i] = z
-            ws[i] = snr
+        def neighbours(i, buckets):
+            gx, gy = cells[i]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for j in buckets.get((gx + dx, gy + dy), ()):
+                        dx_m = xs[i] - xs[j]
+                        dy_m = ys[i] - ys[j]
+                        if dx_m * dx_m + dy_m * dy_m <= eps2:
+                            yield j
 
-        inv = 1.0 / DBSCAN_EPS
-        grid: dict[tuple[int, int], list[int]] = {}
-        for i in range(n):
-            grid.setdefault((int(xs[i] * inv), int(ys[i] * inv)), []).append(i)
+        def is_core(i):
+            for count, _ in enumerate(neighbours(i, grid), 1):
+                if count == MIN_PTS:
+                    return True
+            return False
 
-        eps2 = DBSCAN_EPS * DBSCAN_EPS
-        visited = bytearray(n)
-        out: list[dict] = []
-
-        for i in range(n):
-            if visited[i]:
+        out = []
+        for i, cell in enumerate(cells):
+            if i not in remaining[cell] or not is_core(i):
                 continue
-            visited[i] = 1
-            stack = [i]
-            members = []
-            while stack:
-                j = stack.pop()
-                members.append(j)
-                gx = int(xs[j] * inv)
-                gy = int(ys[j] * inv)
-                for dx in (-1, 0, 1):
-                    for dy in (-1, 0, 1):
-                        for k in grid.get((gx + dx, gy + dy), ()):
-                            if visited[k]:
-                                continue
-                            ddx = xs[k] - xs[j]
-                            ddy = ys[k] - ys[j]
-                            if ddx * ddx + ddy * ddy <= eps2:
-                                visited[k] = 1
-                                stack.append(k)
+            remaining[cell].remove(i)
+            members = [i]
+            pending = [i]
+            while pending:
+                # Only core points expand the cluster. Border points join once.
+                for j in list(neighbours(pending.pop(), remaining)):
+                    remaining[cells[j]].remove(j)
+                    members.append(j)
+                    if is_core(j):
+                        pending.append(j)
 
-            k = len(members)
-            if k < MIN_PTS or k > MAX_PTS:
+            n = len(members)
+            if n > MAX_PTS or max(members) < fresh_start:
                 continue
-            sx = sy = sz = sw = 0.0
-            for j in members:
-                sx += xs[j]; sy += ys[j]; sz += zs[j]; sw += ws[j]
             out.append({
-                "x": sx / k, "y": sy / k, "z": sz / k,
-                "snr": sw / k, "n": k,
+                "x": sum(xs[j] for j in members) / n,
+                "y": sum(ys[j] for j in members) / n,
+                "z": sum(zs[j] for j in members) / n,
+                "snr": sum(weights[j] for j in members) / n,
+                "n": n,
             })
         return out
 
     # ---------------- 主更新 ----------------
-    def update(self, points: list, dt: float) -> list[dict]:
+    def update(self, points: list, dt: float, *, fresh_start: int = 0) -> list[dict]:
         self.frames += 1
         dt = max(1e-3, min(1.0, dt))
-        clusters = self._cluster(points)
+        clusters = self._cluster(points, fresh_start=fresh_start)
 
         # 预测全部航迹
         preds = {t.id: t.predict(dt) for t in self.tracks}
@@ -237,7 +213,7 @@ class Tracker:
             if t.id not in used_t:
                 t.miss()
 
-        # 未匹配的簇：新建航迹（只给 4 m 内的，远处多半是墙）
+        # Start tracks only from unmatched clusters within 12 m.
         for ci, c in enumerate(clusters):
             if ci in used_c:
                 continue

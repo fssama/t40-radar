@@ -12,7 +12,6 @@ import argparse
 import os
 import sys
 import threading
-import time
 import webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,31 +43,23 @@ def main() -> int:
 
     root = os.path.join(HERE, "frontend")
     app = RadarApp(scene=args.scene, source=args.source, fps=args.fps)
-    app.start()
-
-    if args.source == "udp":
-        from backend.app import UdpSource
-        UdpSource(app).start()
-
-    httpd = create_server(app, root, args.host, args.port)
     url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{args.port}/"
 
-    print(BANNER)
-    print(f"  数据源   : {args.source}")
-    print(f"  监听     : http://{args.host}:{args.port}/")
-    print(f"  打开     : {url}")
-    print(f"  提示     : Ctrl+C 退出\n")
-
-    if args.open:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n正在退出…")
-    finally:
-        app.stop()
-        httpd.shutdown()
+    with create_server(app, root, args.host, args.port) as httpd:
+        try:
+            app.start()
+            print(BANNER)
+            print(f"  数据源   : {args.source}")
+            print(f"  监听     : http://{args.host}:{args.port}/")
+            print(f"  打开     : {url}")
+            print(f"  提示     : Ctrl+C 退出\n")
+            if args.open:
+                threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n正在退出…")
+        finally:
+            app.stop()
     return 0
 
 

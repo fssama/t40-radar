@@ -24,8 +24,9 @@
       +7..10 seq (u32)
       +12..13 ep1, +18..19 ep2
       +23 header CRC8（覆盖 +0..+22）
-      +24..25 msg 小端（0x1E61）
+      +24..25 msg 大端（0x1E61）
     1E61 payload = 69B 头 + N×16B，记录 <H f f f H> = id, x, y, z, metric
+      x/y/z 使用分米，场景几何使用米
       头 +3..4 = 记录数 u16，头 +65..66 = subtype
     CRC8  : 反射，poly 0x8C，init 0x77
     CRC16 : 反射，poly 0x8408，init 0x3692
@@ -85,6 +86,7 @@ def crc16(data: bytes, crc: int = 0x3692) -> int:
 # --------------------------------------------------------------------------
 MSG_PERCEPTION = 0x1E61
 SUBTYPE_PCLA = 2
+UNIT_DM = 0.1  # Wire coordinate scale in metres, same as backend/protocol/v2.py.
 
 EP1 = 0x0012   # 与 backend/protocol/v2.py 的 EP_PERCEPTION=(0x12, 0x04) 一致
 EP2 = 0x0004
@@ -123,7 +125,26 @@ def build_1e61(records: list[tuple[int, float, float, float, int]],
 
 
 # --------------------------------------------------------------------------
-# 简易场景：返回该方位的回波列表 (range, z, snr, subtype)
+def encode_scan(points: list, seq: int) -> list[bytes]:
+    """Produce one V2 datagram per subtype present in the scan."""
+    groups = {}
+    for az, distance, z, snr, subtype in points:
+        records = groups.setdefault(subtype, [])
+        i = len(records)
+        angle = math.radians(az)
+        rid = i % 22 + 1 if subtype == SUBTYPE_PCLA else i
+        records.append((rid, distance * math.cos(angle) / UNIT_DM,
+                        distance * math.sin(angle) / UNIT_DM, z / UNIT_DM,
+                        int(max(0.0, min(1.0, snr)) * 65535)))
+    frames = []
+    for subtype, records in groups.items():
+        payload = build_1e61(records, subtype=subtype, seq=seq)
+        frames.append(build_v2(MSG_PERCEPTION, payload, seq))
+        seq += 1
+    return frames
+
+
+# 简易场景：返回该方位的回波列表 (range_m, z_m, snr, subtype)
 # --------------------------------------------------------------------------
 def _ray_rect(az_deg: float, half_w: float, half_d: float) -> float:
     a = math.radians(az_deg)
@@ -232,22 +253,15 @@ def main() -> int:
                         pts.append(((az + rng.gauss(0.0, 0.15)) % 360.0,
                                     r + rng.gauss(0, .015), z, snr, sub))
 
-            recs = []
-            for i, (az, r, z, snr, sub) in enumerate(pts):
-                a = math.radians(az)
-                x = r * math.cos(a)
-                y = r * math.sin(a)
-                rid = (i % 22) + 1 if sub == 2 else (i % 65535)
-                recs.append((rid, x, y, z, int(max(0.0, min(1.0, snr)) * 65535)))
-            payload = build_1e61(recs, subtype=SUBTYPE_PCLA, seq=seq)
-            frame = build_v2(MSG_PERCEPTION, payload, seq)
-            sock.sendto(frame, (args.host, args.port))
-            seq += 1
-            total_pts += len(recs)
+            frames = encode_scan(pts, seq)
+            for frame in frames:
+                sock.sendto(frame, (args.host, args.port))
+            seq += len(frames)
+            total_pts += len(pts)
 
             now = time.time()
             if not args.quiet and now - last_report >= 2.0:
-                print(f"[sender] seq={seq} pts={len(recs)} frame={len(frame)}B "
+                print(f"[sender] seq={seq} pts={len(pts)} bytes={sum(map(len, frames))} "
                       f"total={total_pts} elapsed={now - t0:.0f}s")
                 last_report = now
             time.sleep(max(0.0, dt - (time.time() - ts)))
