@@ -368,7 +368,7 @@ function onPacket(message) {
       showAvoidance(message.avoidance);
       break;
     case 'tracks':
-      showTracks(message.tracks);
+      if (state.feeds.point_cloud === 'live' && state.pointPacket) showTracks(message.tracks);
       break;
     case 'omni': {
       const t = now();

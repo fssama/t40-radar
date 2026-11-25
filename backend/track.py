@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from itertools import product
 
 TRACK_WINDOW = 0.35       # 新旧点共同建立簇的最长时间跨度，秒
+MAX_WINDOW_POINTS = 8192  # 密集或突发报文仍限制单次聚类的输入量
 CLUSTER_RADIUS_M = 0.50   # 三维邻域半径
 MIN_PTS = 5               # 核心点邻居数，含自身
-MAX_PTS = 400             # 过大的连续回波簇通常是背景
+MAX_PTS = 400             # 单次观测中过大的连续簇通常是背景
 MATCH_RADIUS_M = 2.5
 INIT_RANGE_M = 12.0
 MAX_TRACKS = 24
@@ -82,7 +83,7 @@ def cluster_detections(history: list[Point], fresh: list[Point]) -> list[Detecti
                 stack.extend(j for j in neighbors if is_core(j))
 
         measured = [points[i] for i in members if i >= fresh_start]
-        if not measured or len(members) > MAX_PTS:
+        if not measured or len(measured) > MAX_PTS:
             continue
         xs, ys, zs, strengths = zip(*measured)
         n = len(measured)
@@ -229,7 +230,7 @@ class Tracker:
         self.tracks: list[Track] = []
         self._next_id = 1
         self._last_observation: tuple[float, int] | None = None
-        self._window: deque[tuple[float, list[Point]]] = deque()
+        self._window: deque[tuple[float, Point]] = deque()
 
     def observe(self, points: list[Point], timestamp: float, seq: int) -> list[dict]:
         """推进一次 PCLA 观测。同序号和乱序数据不更新航迹。"""
@@ -243,12 +244,15 @@ class Tracker:
             else:
                 self._window.clear()
         self._last_observation = (timestamp, seq)
+        if len(points) > MAX_WINDOW_POINTS:
+            points = points[-MAX_WINDOW_POINTS:]
         while self._window and timestamp - self._window[0][0] > TRACK_WINDOW:
             self._window.popleft()
-        history = [point for _, batch in self._window for point in batch] if points else []
+        while len(self._window) + len(points) > MAX_WINDOW_POINTS:
+            self._window.popleft()
+        history = [point for _, point in self._window] if points else []
         detections = cluster_detections(history, points)
-        if points:
-            self._window.append((timestamp, points))
+        self._window.extend((timestamp, point) for point in points)
 
         self.tracks = [track for track in self.tracks if not track.expired(timestamp)]
         matched = associate([track.predict(timestamp) for track in self.tracks], detections)

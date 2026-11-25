@@ -59,7 +59,8 @@ def main() -> int:
     finally:
         if udp is not None:
             udp.stop()
-            udp.join(timeout=1.0)
+            if udp.ident is not None:
+                udp.join(timeout=1.0)
         httpd.server_close()
     return 0
 

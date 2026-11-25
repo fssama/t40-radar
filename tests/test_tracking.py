@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 from backend.app import RadarApp
 from backend.protocol import crc8, crc16
-from backend.track import COAST_S, Detection, Tracker, associate, cluster_detections
+from backend.track import (COAST_S, MAX_PTS, MAX_WINDOW_POINTS, TRACK_WINDOW, Detection,
+                           Tracker, associate, cluster_detections)
 
 
 def cloud(x, z=0.0):
@@ -98,6 +99,32 @@ class TrackingTest(unittest.TestCase):
         self.assertEqual(cluster_detections(old, [(5, 0, 0, 1.0)]), [])
         detection, = cluster_detections(old, [(3.2, 0, 0, 0.5)])
         self.assertEqual(detection, Detection((3.2, 0, 0), 0.5))
+
+    def test_dense_target_remains_observed_across_the_window(self):
+        tracker = Tracker()
+        points = [(3.0, (i % 10) * 0.01, 0.0, 1.0) for i in range(85)]
+        for seq in range(1, 9):
+            tracks = tracker.observe(points, 100 + seq * 0.04, seq)
+            if seq >= 3:
+                track, = tracks
+                self.assertEqual((track['id'], track['status'], track['hits']),
+                                 (1, 'observed', seq))
+        self.assertEqual(cluster_detections([], points[0:1] * (MAX_PTS + 1)), [])
+
+    def test_history_is_bounded_by_age_and_point_count(self):
+        tracker = Tracker()
+        old = (3.0, 0.0, 0.0, 1.0)
+        new = (4.0, 0.0, 0.0, 1.0)
+        size = MAX_WINDOW_POINTS // 2
+        with patch('backend.track.cluster_detections', return_value=[]) as cluster:
+            tracker.observe([old] * size, 100.00, 1)
+            tracker.observe([new] * size, 100.05, 2)
+            tracker.observe([new] * size, 100.10, 3)
+            history, fresh = cluster.call_args.args
+            self.assertEqual(history, [new] * size)
+            self.assertEqual(len(history) + len(fresh), MAX_WINDOW_POINTS)
+            tracker.observe([old], 100.10 + TRACK_WINDOW + 0.01, 4)
+            cluster.assert_called_with([], [old])
 
     def test_global_matching_preserves_two_existing_ids(self):
         detections = [Detection((x, 0, 0), 1.0) for x in (1.2, 2.2)]

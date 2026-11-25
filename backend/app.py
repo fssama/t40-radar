@@ -9,12 +9,12 @@ import queue
 import socket
 import threading
 import time
-from dataclasses import dataclass
 
 from tools.read_omni_sectors import frame_points
 
 from .protocol import (
-    MSG_PERCEPTION, SUBTYPE_PCLA, UNIT_DM, parse_1e61, parse_1e62, parse_v1, parse_v2,
+    MSG_PERCEPTION, SUBTYPE_GROUND, SUBTYPE_PCLA, SUBTYPE_WIRE, UNIT_DM,
+    parse_1e61, parse_1e62, parse_v1, parse_v2,
 )
 from .track import Tracker
 
@@ -24,9 +24,26 @@ TRACK_REFRESH_S = 0.25
 log = logging.getLogger(__name__)
 
 
-@dataclass
 class Client:
-    q: queue.Queue
+    """保留各类 SSE 事件的最新一份，并按发布顺序取出。"""
+
+    def __init__(self):
+        self._ready = threading.Condition()
+        self._pending: dict[str, tuple[float, str]] = {}
+
+    def put(self, kind: str, timestamp: float, data: str):
+        with self._ready:
+            self._pending.pop(kind, None)
+            self._pending[kind] = (timestamp, data)
+            self._ready.notify()
+
+    def get(self, timeout: float) -> tuple[str, float, str]:
+        with self._ready:
+            if not self._ready.wait_for(lambda: bool(self._pending), timeout):
+                raise queue.Empty
+            kind = next(iter(self._pending))
+            timestamp, data = self._pending.pop(kind)
+            return kind, timestamp, data
 
 
 class RadarApp:
@@ -91,8 +108,10 @@ class RadarApp:
 
     # ---------------- 客户端 ----------------
     def add_client(self) -> Client:
-        c = Client(queue.Queue(maxsize=32))
+        c = Client()
         with self.lock:
+            # 状态事件由 HTTP 线程在写出时读取，避免发送过期的快照。
+            c.put("radar_status", time.monotonic(), "")
             self.clients.append(c)
         return c
 
@@ -104,16 +123,9 @@ class RadarApp:
     def _broadcast(self, obj: dict):
         data = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
         with self.lock:
+            timestamp = time.monotonic()
             for c in self.clients:
-                try:
-                    c.q.put_nowait(data)
-                except queue.Full:
-                    # 慢客户端跳过积压的旧帧，继续接收新数据。
-                    try:
-                        c.q.get_nowait()
-                    except queue.Empty:
-                        pass
-                    c.q.put_nowait(data)
+                c.put(obj["type"], timestamp, data)
 
     def refresh_tracks(self, timestamp: float) -> dict | None:
         """点云暂停时，让页面按时显示预测状态并清除过期航迹。"""
@@ -126,7 +138,10 @@ class RadarApp:
         return {"type": "tracks", "tracks": tracks}
 
     # ---------------- 真机 UDP 上行 ----------------
-    def radar_status(self) -> dict:
+    def status_snapshot(self) -> tuple[dict, dict | None]:
+        """用同一时刻的观测判断链路状态，同时返回仍有效的避障数据。"""
+        point_at = self._last_udp_ts
+        avoidance = self.last_avoidance
         now = time.monotonic()
 
         def status(timestamp):
@@ -134,20 +149,22 @@ class RadarApp:
                 return "waiting"
             return "live" if now - timestamp < RADAR_TIMEOUT_S else "stale"
 
-        avoidance = self.last_avoidance
-        return {"point_cloud": status(self._last_udp_ts),
-                "avoidance": status(avoidance[0] if avoidance else None)}
+        radar = {"point_cloud": status(point_at),
+                 "avoidance": status(avoidance[0] if avoidance else None)}
+        if avoidance is not None and radar["avoidance"] == "live":
+            timestamp, data = avoidance
+            return radar, {**data, "age_s": round(now - timestamp, 3)}
+        return radar, None
+
+    def radar_status(self) -> dict:
+        return self.status_snapshot()[0]
 
     @property
     def running(self) -> bool:
         return self.radar_status()["point_cloud"] == "live"
 
     def current_avoidance(self) -> dict | None:
-        last = self.last_avoidance
-        if last is None:
-            return None
-        ts, data = last
-        return {**data, "age_s": round(time.monotonic() - ts, 3)}
+        return self.status_snapshot()[1]
 
     def ingest_udp(self, data: bytes) -> dict | None:
         """接收雷达业务报文与原始侧阵回波。"""
@@ -171,7 +188,11 @@ class RadarApp:
         if frame.msg != MSG_PERCEPTION or not frame.crc_ok:
             return None
         d = parse_1e61(frame.payload)
+        if d["subtype"] not in (SUBTYPE_GROUND, SUBTYPE_WIRE, SUBTYPE_PCLA):
+            return None
         recs = [r for r in d["records"] if all(map(math.isfinite, (r.x, r.y, r.z)))]
+        if d["count"] and not recs:
+            return None
         pts = [[round(r.az, 2), round(r.rng, 3), round(r.z * UNIT_DM, 3),
                 round(r.metric / 65535.0, 3), d["subtype"]] for r in recs]
 
@@ -226,14 +247,20 @@ class UdpSource(threading.Thread):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.bind((bind_host, bind_port))
-        except OSError:
+            self.bind_port = self.sock.getsockname()[1]
+            self.sock.settimeout(TRACK_REFRESH_S)
+        except BaseException:
             self.sock.close()
             raise
-        self.bind_port = self.sock.getsockname()[1]
-        self.sock.settimeout(TRACK_REFRESH_S)
         self._stopping = threading.Event()
 
     def run(self):
+        try:
+            self._receive()
+        finally:
+            self.sock.close()
+
+    def _receive(self):
         previous = self.app.radar_status()
         next_track_refresh = time.monotonic() + TRACK_REFRESH_S
         while not self._stopping.is_set():
@@ -242,8 +269,12 @@ class UdpSource(threading.Thread):
             except socket.timeout:
                 pass
             except OSError:
-                break
+                if not self._stopping.is_set():
+                    log.exception("Radar UDP receive failed")
+                return
             else:
+                if self._stopping.is_set():
+                    return
                 try:
                     msg = self.app.ingest_udp(data)
                     if msg:
@@ -254,9 +285,12 @@ class UdpSource(threading.Thread):
                     log.exception("Failed to process radar datagram")
             now = time.monotonic()
             if now >= next_track_refresh:
-                update = self.app.refresh_tracks(now)
-                if update is not None:
-                    self.app._broadcast(update)
+                try:
+                    update = self.app.refresh_tracks(now)
+                    if update is not None:
+                        self.app._broadcast(update)
+                except Exception:
+                    log.exception("Failed to refresh radar tracks")
                 next_track_refresh = now + TRACK_REFRESH_S
             status = self.app.radar_status()
             if status != previous:

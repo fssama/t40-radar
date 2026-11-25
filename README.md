@@ -135,8 +135,8 @@ tools/radar_avoidance_relay.py VM 侧 1E62 转发
 |---|---|---|
 | GET | `/` | 页面 |
 | GET | `/events` | SSE 帧流 |
-| GET | `/api/state` | 当前状态 JSON，真机模式下 `radar` 分别报告 1E61 和 1E62 的 `waiting` / `live` / `stale` |
-| GET | `/api/protocol` | 最近一帧协议字段 + hex |
+| GET | `/api/state` | `radar` 分别报告 1E61 和 1E62 的 `waiting` / `live` / `stale`。`running` 表示近期收到有效 1E61。1E62 未收到或已过期时 `avoidance` 为 `null` |
+| GET | `/api/protocol` | 最近一次通过校验的帧及 hex，含各链路当前状态 |
 | POST | `/api/control` | `{"action":"motor","value":转速}`，经 VM 桥下发 |
 
 ---

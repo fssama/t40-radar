@@ -10,10 +10,14 @@ import mimetypes
 import os
 import queue
 import math
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .app import RadarApp
+from .app import RADAR_TIMEOUT_S, RadarApp
+
+SSE_WRITE_TIMEOUT_S = 2.0
+SSE_EVENT_TTL_S = {"frame": RADAR_TIMEOUT_S, "avoidance": RADAR_TIMEOUT_S, "omni": 4.0}
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -79,21 +83,21 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/events":
             return self._sse()
         if p == "/api/state":
-            radar = self.app.radar_status()
+            radar, avoidance = self.app.status_snapshot()
             return self._send_json({
                 "running": radar["point_cloud"] == "live",
                 "frames": self.app.frame_count,
                 "crc_ok": True if radar["point_cloud"] == "live" else None,
                 "source": "udp",
                 "motor_speed": self.app.last_motor,
-                "avoidance": self.app.current_avoidance(),
+                "avoidance": avoidance,
                 "radar": radar,
             })
         if p == "/api/protocol":
-            avoidance = self.app.current_avoidance()
+            avoidance = self.app.last_avoidance
             return self._send_json({
                 "1E61": self.app.last_point_protocol,
-                "1E62": avoidance["proto"] if avoidance else None,
+                "1E62": avoidance[1]["proto"] if avoidance else None,
                 "radar": self.app.radar_status(),
             })
 
@@ -129,32 +133,36 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------- SSE ----------------
     def _sse(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-
         client = self.app.add_client()
         try:
+            self.connection.settimeout(SSE_WRITE_TIMEOUT_S)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
             self.wfile.write(b": connected\n\n")
-            status = {"type": "radar_status", "radar": self.app.radar_status(),
-                      "avoidance": self.app.current_avoidance()}
-            self.wfile.write(b"data: " + json.dumps(status).encode() + b"\n\n")
             self.wfile.flush()
             while True:
                 try:
-                    data = client.q.get(timeout=15.0)
+                    kind, timestamp, data = client.get(timeout=15.0)
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
                     continue
+                ttl = SSE_EVENT_TTL_S.get(kind)
+                if ttl is not None and time.monotonic() - timestamp >= ttl:
+                    continue
+                if kind == "radar_status":
+                    radar, avoidance = self.app.status_snapshot()
+                    data = json.dumps({"type": kind, "radar": radar, "avoidance": avoidance})
                 self.wfile.write(b"data: " + data.encode() + b"\n\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         finally:
+            self.close_connection = True
             self.app.remove_client(client)
 
 
